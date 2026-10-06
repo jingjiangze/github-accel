@@ -248,6 +248,19 @@ async function main() {
     log('已撤销 ' + failed.length + ' 条：' + failed.join(', '))
     for (const d of failed) if (report.domains[d]) { report.domains[d].revoked = true; report.domains[d].pin4 = null; report.domains[d].pinned = null }
   }
+  // T：入口体检并入同一节奏，report.json 因此同时是"这一轮所有通道的快照"
+  try {
+    const d = await run(process.execPath, [path.join(HERE, 'gh.mjs'), 'doctor', '--force'], 240000)
+    const ps = JSON.parse(fs.readFileSync(path.join(HERE, 'proxy-state.json'), 'utf8'))
+    report.proxies = {
+      at: ps.at,
+      entries: ps.entries.map(function (e) {
+        return { prefix: e.prefix, ok: e.ok, ms: e.ms, mbps: Math.round((e.bps || 0) / 10485.76) / 100 }
+      })
+    }
+    log('入口体检：' + report.proxies.entries.filter(function (x) { return x.ok }).length + ' 可用 / ' + report.proxies.entries.length + ' 已测')
+    if (VERBOSE) for (const line of String(d.stdout).split(/\r?\n/).slice(1)) log('    ', line)
+  } catch (e) { log('入口体检未完成：' + ((e && e.message) || e)) }
   fs.writeFileSync(path.join(HERE, 'report.json'), JSON.stringify(report, null, 1))
   log('==== 完成：评估 ' + Object.keys(report.domains).length + ' 域，保留 ' + (DRY ? 0 : chosen.length - failed.length) + ' 条固定，撤销 ' + failed.length + ' 条，报告 report.json ====')
 }
