@@ -57,6 +57,8 @@ schtasks /delete /tn QoderAccel /f
 ## 安全边界
 
 - 公开反代会看到你要下载的完整地址并透传请求头。`gh.mjs` 对疑似带凭据的输入（`oauth2:`、`ghp_*`、`github_pat_*`、URL 内嵌账密）**直接拒绝外送**，私有仓库请自建反代或走代理节点。
+- 自建 `relay/` 的密钥走在 URL 路径里，因此它会出现在 Cloudflare 侧的请求日志与统计中，知道完整 URL 的人即可使用该入口（限 GitHub 域）。当作"你自己知道的一串地址"来管理，需要轮换时改 `RELAY_KEY` 重写一次 secret 再部署。
+
 - hosts 只替换 `# >>> accel-start >>> ... # <<< accel-end <<<` 标记块，其余行原样保留；每轮先备份。
 - Clash/mihomo 的 TUN 或系统代理任一开启后，内核不读系统 hosts（`use-system-hosts: false`），A 层会被架空——此时应把 GitHub 域名规则改为直连组，或只依赖 B 层。
 
