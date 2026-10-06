@@ -15,6 +15,7 @@ const ARGV = process.argv.slice(2)
 const DRY = ARGV.includes('--dry')
 const REVERT = ARGV.includes('--revert')
 const VERBOSE = ARGV.includes('-v')
+const SELFTEST = ARGV.includes('--selftest')
 const IPV4 = /^\d{1,3}(\.\d{1,3}){3}$/
 const IPV6 = /^[0-9a-f:]+$/i
 const DOMRE = /^[a-z0-9._-]+$/i
@@ -186,7 +187,9 @@ async function evalDomain(dom, conf, remote) {
     reason = 'v4 ' + (base4 ? base4.ms : '不可用') + '→' + (take4 ? take4.ms : '不写') +
       '，v6 ' + (base6 ? base6.ms : (sysHasV6 ? '不可用' : '无记录')) + '→' + (take6 ? take6.ms : '不写') + 'ms'
   } else reason = '现状已是最优' + (sysHasV6 ? '（系统 AAAA 可直接用）' : '')
-  return { dom, pin4: use ? use.ip4 : null, pin6: use ? use.ip6 : null, pin4ms: use ? use.ms : 0, base4: base4 || null, base6: base6 || null, sysHasV6, reason, tried: res.length, all: res }
+  return { dom, pin4: use ? use.ip4 : null, pin6: use ? use.ip6 : null, pin4ms: use ? use.ms : 0,
+    alt4: pin4 ? pin4.ip : null, alt6: pin6 ? pin6.ip : null,
+    base4: base4 || null, base6: base6 || null, sysHasV6, reason, tried: res.length, all: res }
 }
 
 async function verify(dom, canary, expect) {
@@ -195,9 +198,18 @@ async function verify(dom, canary, expect) {
     '-w', '%{remote_ip} %{http_code} %{time_total}', url], 20000)
   const m = r.stdout.match(/^(\S+)\s+(\d+)\s+([\d.]+)/)
   const rip = m ? m[1] : ''
-  if (!rip) return { ok: false, detail: '连接失败 ' + (m ? m[2] : '000') }
-  if (expect.indexOf(rip) < 0) return { ok: false, detail: '实际连到 ' + rip + '，不是写入的 ' + expect.join('/') }
-  return { ok: true, detail: rip + ' ' + m[2] + ' ' + Math.round(Number(m[3]) * 1000) + 'ms' }
+  if (!rip) return { ok: false, remote: '', detail: '连接失败 ' + (m ? m[2] : '000') }
+  if (expect.indexOf(rip) < 0) return { ok: false, remote: rip, detail: '泄漏到未钉的 ' + rip + '（写入的是 ' + expect.join('/') + '）' }
+  return { ok: true, remote: rip, code: Number(m[2]), ms: Math.round(Number(m[3]) * 1000), detail: rip + ' ' + m[2] + ' ' + Math.round(Number(m[3]) * 1000) + 'ms' }
+}
+
+// 复核泄漏后该怎么办：泄漏那一族根本没写过 → 补钉它；已经写过还不贴 → 整域撤销
+function planAfterLeak(c, remote) {
+  const v6 = String(remote).indexOf(':') >= 0
+  const key = v6 ? 'ip6' : 'ip'
+  const alt = v6 ? c.alt6 : c.alt4
+  if (!c[key] && alt) return { action: 'plug', key, ip: alt }
+  return { action: 'revoke' }
 }
 
 async function main() {
@@ -218,7 +230,7 @@ async function main() {
     if (CFG.deny.indexOf(dom) >= 0 || !DOMRE.test(dom)) continue
     const conf = CFG.domains[dom] || {}
     const r = await evalDomain(dom, conf, remote)
-    if (r.pin4 || r.pin6) chosen.push({ dom, ip: r.pin4, ip6: r.pin6, canary: conf.canary || '/' })
+    if (r.pin4 || r.pin6) chosen.push({ dom, ip: r.pin4, ip6: r.pin6, alt4: r.alt4, alt6: r.alt6, canary: conf.canary || '/' })
     report.domains[dom] = { baseline: r.base4, baseline6: r.base6, sys_has_aaaa: r.sysHasV6, pinned: r.pin4, pinned6: r.pin6, reason: r.reason, tried: r.tried, probed: r.all }
     log((r.pin4 || r.pin6 ? '固定 ' : '跳过 '), dom.padEnd(28), (r.pin4 || r.pin6 || (r.base4 && r.base4.ok ? r.base4.ip : '-')).padEnd(22),
       String(r.base4 ? r.base4.ms + 'ms' : '无').padEnd(9), String(r.pin4 || r.pin6 ? r.pin4ms + 'ms' : '-').padEnd(9), r.reason)
@@ -232,22 +244,41 @@ async function main() {
     }
     return [MARK_S, '# 生成时间 ' + new Date().toISOString(), '# 候选来源 GitHub520 + GitHub-IP-hosts + DoH(A/AAAA) + 内置，全部经本机 TLS 实测', lines.join('\r\n'), MARK_E].join('\r\n')
   }
-  writeHosts(render(chosen))
-  await run('ipconfig.exe', ['/flushdns'], 10000)
-  // 写入后按真实解析复核：探针可能单轮侥幸通过，落地不成立就当场撤销，不给它活到下一轮的机会
-  const failed = []
-  for (const c of chosen) {
-    const v = await verify(c.dom, c.canary, [c.ip, c.ip6].filter(Boolean))
-    log((v.ok ? '生效  ' : '! 撤销 ') + c.dom.padEnd(28) + v.detail)
-    if (!v.ok) failed.push(c.dom)
+  const doWrite = async function (list) {
+    writeHosts(render(list))
+    await run('ipconfig.exe', ['/flushdns'], 8000)
   }
+  const recheck = async function (list) {
+    const bad = []
+    for (const c of list) {
+      const v = await verify(c.dom, c.canary, [c.ip, c.ip6].filter(Boolean))
+      log((v.ok ? '生效  ' : '! 泄漏 ') + c.dom.padEnd(28) + v.detail)
+      if (!v.ok) bad.push({ c, v })
+    }
+    return bad
+  }
+  // 写入后按真实解析复核：探针可能单轮侥幸通过，落地不成立就不该留在 hosts 里
+  await doWrite(chosen)
+  let bad = await recheck(chosen)
+  // 泄漏的常见原因是只钉了一族，另一族仍由 DNS/隧道给出并被优先选中。
+  // 先按族补钉（用实测可用的另一族候选），补不上的才撤销整域。
+  const plugged = []
+  for (const b of bad) {
+    const pl = planAfterLeak(b.c, b.v.remote)
+    if (pl.action === 'plug') { b.c[pl.key] = pl.ip; plugged.push(b.c.dom + (pl.key === 'ip6' ? ':v6' : ':v4')) }
+    else log('  ' + b.c.dom + ' 泄漏族已写过或无候选 -> 撤销')
+  }
+  if (plugged.length) {
+    log('补钉未覆盖族：' + plugged.join(' ') + ' -> 第二轮复核')
+    await doWrite(chosen)
+    bad = await recheck(chosen)
+  }
+  const failed = bad.map(function (x) { return x.c.dom })
   if (failed.length && !DRY) {
-    const keep = chosen.filter(function (c) { return failed.indexOf(c.dom) < 0 })
-    writeHosts(render(keep))
-    await run('ipconfig.exe', ['/flushdns'], 10000)
+    await doWrite(chosen.filter(function (c) { return failed.indexOf(c.dom) < 0 }))
     log('已撤销 ' + failed.length + ' 条：' + failed.join(', '))
-    for (const d of failed) if (report.domains[d]) { report.domains[d].revoked = true; report.domains[d].pin4 = null; report.domains[d].pinned = null }
   }
+  for (const d of failed) if (report.domains[d]) { report.domains[d].revoked = true }
   // T：入口体检并入同一节奏，report.json 因此同时是"这一轮所有通道的快照"
   try {
     const d = await run(process.execPath, [path.join(HERE, 'gh.mjs'), 'doctor', '--force'], 240000)
@@ -264,4 +295,24 @@ async function main() {
   fs.writeFileSync(path.join(HERE, 'report.json'), JSON.stringify(report, null, 1))
   log('==== 完成：评估 ' + Object.keys(report.domains).length + ' 域，保留 ' + (DRY ? 0 : chosen.length - failed.length) + ' 条固定，撤销 ' + failed.length + ' 条，报告 report.json ====')
 }
+// 不依赖网络的判定自测：泄漏族没写过 -> 补钉；已写过或没候选 -> 撤销
+if (SELFTEST) {
+  const cases = [
+    [{ ip: '1.1.1.1', ip6: null, alt4: '2.2.2.2', alt6: '2606::1' }, '2001:2::24', { action: 'plug', key: 'ip6', ip: '2606::1' }],
+    [{ ip: null, ip6: '2606::9', alt4: '2.2.2.2', alt6: '2606::9' }, '2001:2::24', { action: 'revoke' }],
+    [{ ip: null, ip6: '2606::9', alt4: '2.2.2.2', alt6: null }, '8.8.8.8', { action: 'plug', key: 'ip', ip: '2.2.2.2' }],
+    [{ ip: '1.1.1.1', ip6: null, alt4: null, alt6: null }, '2001:2::24', { action: 'revoke' }],
+    [{ ip: null, ip6: null, alt4: '2.2.2.2', alt6: null }, '', { action: 'plug', key: 'ip', ip: '2.2.2.2' }]
+  ]
+  let bad = 0
+  for (const [c, remote, want] of cases) {
+    const got = planAfterLeak(c, remote)
+    const ok = got.action === want.action && (want.action !== 'plug' || (got.key === want.key && got.ip === want.ip))
+    if (!ok) bad++
+    console.log('  ' + (ok ? 'PASS' : 'FAIL') + '  泄漏=' + (remote || '(无响应)') + ' -> ' + JSON.stringify(got) + (ok ? '' : '，期望 ' + JSON.stringify(want)))
+  }
+  console.log(bad ? '  自测失败 ' + bad + ' 项' : '  自测 ' + cases.length + '/' + cases.length + ' 通过')
+  process.exit(bad ? 1 : 0)
+}
+
 main().then(releaseLock, function (e) { log('致命', (e && e.stack) || String(e)); releaseLock(); process.exit(1) })
