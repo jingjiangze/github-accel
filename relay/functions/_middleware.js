@@ -41,16 +41,22 @@ export async function onRequest(ctx) {
   const m = u.pathname.match(/^\/r\/[^/]+\/(https?:\/\/.+)$/)
   if (!m) return ctx.next()
   if (!same(decodeURIComponent(u.pathname.split('/')[2] || ''), key)) return bad(403, 'bad key')
-  if (request.method !== 'GET' && request.method !== 'HEAD') return bad(405, 'method not allowed')
+  if (['GET', 'HEAD', 'POST'].indexOf(request.method) < 0) return bad(405, 'method not allowed')
 
   let target
   try { target = new URL(m[1] + u.search) } catch (e) { return bad(400, 'bad target') }
   if (target.protocol !== 'https:' || !ALLOW.has(target.hostname.toLowerCase())) return bad(403, 'host not allowed')
 
   const H = new Headers()
-  H.set('user-agent', 'accel-relay/1.0')
+  // 保留客户端 UA：GitHub 靠 git/* 的 User-Agent 决定回 pkt-line 还是 HTML 页，
+  // 改写它就会让 git clone 收到一坨网页而不是 refs
+  H.set('user-agent', request.headers.get('user-agent') || 'git/2.50.0')
   H.set('accept-encoding', 'identity')
   H.set('accept', request.headers.get('accept') || '*/*')
+  if (request.method === 'POST') {
+    const ct = request.headers.get('content-type'); if (ct) H.set('content-type', ct)
+    const ce = request.headers.get('content-encoding'); if (ce) H.set('content-encoding', ce)
+  }
   if (env.RELAY_ALLOW_AUTH === '1') {
     const auth = request.headers.get('authorization')
     if (auth) H.set('authorization', auth)
@@ -58,7 +64,12 @@ export async function onRequest(ctx) {
 
   let up
   try {
-    up = await fetch(target.toString(), { method: request.method, headers: H, redirect: 'follow' })
+    up = await fetch(target.toString(), {
+      method: request.method,
+      headers: H,
+      redirect: 'follow',
+      body: request.method === 'POST' ? request.body : undefined
+    })
   } catch (e) {
     return bad(502, 'upstream fetch failed')
   }
