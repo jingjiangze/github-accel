@@ -1,6 +1,6 @@
 # Installs / refreshes the windowless 10-minute accel pass as a scheduled task.
 $ErrorActionPreference = 'Stop'
-$dir = 'C:\DDDD\Agent Work\accel'
+$dir = Split-Path -Parent $MyInvocation.MyCommand.Path
 $cfg = Get-Content (Join-Path $dir 'config.json') -Raw -Encoding UTF8 | ConvertFrom-Json
 $min = [int]$cfg.interval_minutes
 $name = [string]$cfg.task_name

@@ -12,3 +12,7 @@ relay-key
 .secrets/
 
 .dev.vars
+
+# wrangler 运行缓存
+.wrangler/
+relay/.wrangler/
