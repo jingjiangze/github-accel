@@ -57,14 +57,26 @@ async function checkOne(prefix, target) {
   const bulk = contentOk ? await bulkSample(prefix) : { code: 0, bytes: 0, bps: 0 }
   return { prefix, ok: contentOk && bulk.bytes > 0, ms, code, bytes, bulk_code: bulk.code, bulk_bytes: bulk.bytes, bps: bulk.bps }
 }
+function relayPrefix() {
+  const r = CFG.relay
+  if (!r || !r.enabled) return null
+  let key = process.env[r.key_env] || ''
+  if (!key) { try { key = fs.readFileSync(path.join(HERE, r.key_file), 'utf8').trim() } catch (e) {} }
+  if (!key) return null
+  return r.base.replace('KEY', encodeURIComponent(key))
+}
+
 async function checkAll(force) {
   let st = null
   try { st = JSON.parse(fs.readFileSync(STATE, 'utf8')) } catch (e) {}
   const fresh = st && Date.now() - st.at < TTL && (st.entries || []).filter(function (e) { return e.ok }).length
   if (fresh && !force) return st
   const target = CFG.proxy_canary
+  const list = CFG.proxies.slice()
+  const rp = relayPrefix()
+  if (rp) list.unshift(rp)
   const entries = []
-  for (const p of CFG.proxies) entries.push(await checkOne(p, target))
+  for (const p of list) entries.push(await checkOne(p, target))
   st = { at: Date.now(), target, entries }
   fs.writeFileSync(STATE, JSON.stringify(st, null, 1))
   return st
