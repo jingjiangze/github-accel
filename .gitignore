@@ -6,3 +6,9 @@ proxy-state.json
 run.lock
 .selftest/
 *.part
+
+# 密钥绝不入库（仓库是公开的）
+relay-key
+.secrets/
+
+.dev.vars

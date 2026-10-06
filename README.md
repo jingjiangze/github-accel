@@ -57,8 +57,36 @@ schtasks /delete /tn QoderAccel /f
 ## 安全边界
 
 - 公开反代会看到你要下载的完整地址并透传请求头。`gh.mjs` 对疑似带凭据的输入（`oauth2:`、`ghp_*`、`github_pat_*`、URL 内嵌账密）**直接拒绝外送**，私有仓库请自建反代或走代理节点。
+- 自建 `relay/` 的密钥走在 URL 路径里，因此它会出现在 Cloudflare 侧的请求日志与统计中，知道完整 URL 的人即可使用该入口（限 GitHub 域）。当作"你自己知道的一串地址"来管理，需要轮换时改 `RELAY_KEY` 重写一次 secret 再部署。
+
 - hosts 只替换 `# >>> accel-start >>> ... # <<< accel-end <<<` 标记块，其余行原样保留；每轮先备份。
 - Clash/mihomo 的 TUN 或系统代理任一开启后，内核不读系统 hosts（`use-system-hosts: false`），A 层会被架空——此时应把 GitHub 域名规则改为直连组，或只依赖 B 层。
+
+## 私有中转端点（`relay/`，可选）
+
+公开反代看得到你要下载的完整 URL，还会透传请求头。`relay/` 是自带的 Cloudflare Pages Functions
+端点，用来把这层暴露收回去：
+
+- 路径 `/r/<密钥>/https://github.com/...`；密钥用定长比较，不匹配直接 403；
+- **域名白名单**只放行 GitHub 相关 host，`example.com` 之类一律 403 —— 它不是开放代理；
+- 默认剥离客户端的 `Authorization` / `Cookie`（只有显式设 `RELAY_ALLOW_AUTH=1` 才透传）；
+- 不做 `api.github.com` 中转：CF 出口 IP 访问 api 一律 403（GitHub 拉黑 CF 段），这是实测结论。
+
+部署（需要自己的 CF 账号，全程可删）：
+
+```bat
+cd relay
+npx wrangler pages project create gh-accel-relay --production-branch main
+npx wrangler pages deploy --branch main
+```
+
+`RELAY_KEY` 以 secret 形式写进 Pages 环境变量，本地副本放 `relay-key`（已 gitignore，
+仓库是公开的，密钥不入库）。配好后 `config.json` 的 `relay.base` 指向
+`https://<项目名>.pages.dev/r/KEY/`，`gh.mjs` 会自动把它插到候选入口最前面参与测速排序。
+
+**坑（踩过的）**：Pages 的 `functions/` 必须在**项目根**（和 `wrangler.toml` 同级）。把它放进部署目录
+`public/` 里时，wrangler 会静默打印 `No Functions. Shimming...`，所有请求直接返回静态页——
+密钥闸门形同虚设。本仓库的结构是 `relay/wrangler.toml` + `relay/functions/` + `relay/public/`。
 
 ## 参考
 
