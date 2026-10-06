@@ -5,7 +5,7 @@
 | 层 | 文件 | 解决什么 |
 |---|---|---|
 | A 自适应 hosts | `accel.mjs` | 头像、raw、归档包、npm/jsDelivr 等**能靠 IP 救**的通道：候选 IP 逐条本机 TLS 实测，只有确实更快才写入 |
-| B 反代选路 | `gh.mjs` | `github.com` 主页首跳、release 下载、`git clone` 这类**换 IP 无效**的通道：按实测带宽挑入口，失败自动换源 |
+| B 竞速取件 | `gh.mjs` | `github.com` 首跳、release 下载、`git clone` 这类**换 IP 无效**的通道：每次请求同时压多个入口，先出数据的胜出，停滞带 Range 换源续传 |
 
 设计取向是**宁可不写，也不写坏**：写错的 hosts 条目比不写更糟（浏览器全站受影响），所以每条固定都要过"多轮实测 + 写入后真实解析复核"，复核不过当场撤销。
 
@@ -50,7 +50,10 @@ schtasks /delete /tn QoderAccel /f
 - `probe.win_ratio`：比现状快多少才写入（默认 0.85，即至少快 15%）。
 - `probe.retries` / `budget_ms`：每 IP 探测轮数与单轮上限。
 - `deny`：永不固定的域名。
-- `proxies`：反代入口清单，`gh.mjs doctor --force` 重新体检。
+- `proxies`：公开反代入口清单，`gh.mjs doctor --force` 重新体检。
+- `proxy_ttl_s`：入口体检缓存（默认 60 秒）。
+- `race`：并发竞速参数——`max` 同开入口数、`first_byte_ms` 首字超时、`speed_limit_bps`/`speed_time_ms` 停滞判定、`retries_per_entry` 续传次数。
+- `clone`：`same_retry` 原地重试、`low_speed_limit`/`low_speed_time` 对应 `http.lowSpeedLimit/Time`。
 
 产物：`logs/`（每轮判定）、`report.json`（逐域明细，含每个 IP 的实测毫秒）、`backups/`（原 hosts，保留 5 份）、`proxy-state.json`（入口缓存 15 分钟）。
 
@@ -87,6 +90,43 @@ npx wrangler pages deploy --branch main
 **坑（踩过的）**：Pages 的 `functions/` 必须在**项目根**（和 `wrangler.toml` 同级）。把它放进部署目录
 `public/` 里时，wrangler 会静默打印 `No Functions. Shimming...`，所有请求直接返回静态页——
 密钥闸门形同虚设。本仓库的结构是 `relay/wrangler.toml` + `relay/functions/` + `relay/public/`。
+
+## 为什么是"竞速"而不是"选最快的入口"
+
+同一条线路的入口带宽会在**一次请求的量级**上翻转，实测（同一 5.2MB 文件，间隔几十秒）：
+
+```
+体检排名        ghfast 3.69 → gh.llkk 3.53 → gh-proxy 2.86 → relay 2.36 MB/s
+按排名单走      gh-proxy 3.45 MB/s
+三路并发竞速    6.68 MB/s（胜出者：体检只排第 2 的 gh.llkk.cc）
+```
+
+所以 `gh.mjs` 不消费"上次测速第一名"：每次请求同时开 `race.max` 个入口，
+`first_byte_ms` 内拿不到字节的踢掉，增速低于 `speed_limit_bps` 判停滞并带 `Range` 换源续传，
+先拿完整的胜出，其余立即终止、`.part` 清掉。体检缓存也从 15 分钟降到 `proxy_ttl_s`（默认 60s）。
+
+`clone` 同源问题：GitHub 按 `User-Agent` 决定回 pkt-line 还是 HTML，所以先**并发探**
+`info/refs` 只留真 pkt-line 的入口，再克隆；schannel 随机握手失败（实测约 1/3 概率）会原地重试一次
+（`clone.same_retry`），并用 `http.lowSpeedLimit/Time` 让断流快速暴露而不是干等。
+实测 `cli/cli` 43MB 浅克隆 9.2s，同期直连要么 21s 连不上要么 `invalid index-pack` 断流。
+
+## 关于 Clash / TUN 的尝试（已回滚，结论记在这里免得再踩）
+
+这台机器 `enable_tun_mode: true` 时，系统 DNS 由 mihomo 接管（返回 fake-ip），而 mihomo
+**不读系统 hosts**（`use-system-hosts: false`），所以 hosts 层要生效必须让目标域名从 fake-ip
+放出来（`dns.fake-ip-filter` + `use-hosts: true`），并按域写 DIRECT 规则。实测结果：
+
+| 配置 | raw | objects | 备注 |
+|---|---|---|---|
+| 原始（全走隧道） | 2/3，1.1–2.2s | 1/3，2.15s | |
+| GitHub 静态域写死 DIRECT | 1/3，成功时 0.70s | **0/3** | 本线路对 `objects`/`gist`/`assets` **没有任何可用直连 IP** |
+| 回滚后（同一份原始配置） | **3/3，0.20s** | **3/3，0.19s** | 与改动无关，只是线路自己变好了 |
+
+第三行是重点：**同一份配置几分钟内从 1/3 变 3/3**，所以静态分流方案的收益无法与波动区分，
+而代价是全局流量路径的风险，本工具因此不碰你的代理配置。要真做自适应分流，正解是
+mihomo 的 `fallback` 组（`DIRECT` ↔ 节点，60s 体检）——注意 CV 的 **Merge 里加 `proxy-groups`
+会被内核校验拒绝**，自定义组要走"代理组文件"（本机已有 `profiles/g7Y3DfeOQCW6.yaml` 那种）。
+另：顶层 `hosts:` 映射经测试实例验证**不被 fake-ip 模式采用**，别再指望它。
 
 ## 参考
 
