@@ -168,27 +168,25 @@ async function evalDomain(dom, conf, remote) {
   const base4 = res.find(function (x) { return x.kind === 'base4' })
   const base6 = res.find(function (x) { return x.kind === 'base6' })
   const pin4 = g4[0] || null, pin6 = g6[0] || null
-  let use = null, reason = ''
-  if (!sysHasV6) {
-    // 系统本来只有 IPv4：直接按"更快才固定"
-    if (!pin4) reason = '无可用候选，保持系统 DNS'
-    else if (base4 && base4.ok && pin4.ip === base4.ip) reason = '现状已是最优'
-    else if (!base4 || !base4.ok) { use = pin4; reason = '现状不可用，改用实测最快' }
-    else if (pin4.ms < base4.ms * CFG.probe.win_ratio) { use = pin4; reason = '比现状快 ' + (100 - Math.round(pin4.ms / base4.ms * 100)) + '%' }
-    else reason = '候选未显著优于现状(' + pin4.ms + ' vs ' + base4.ms + 'ms)'
-  } else {
-    // 系统有 AAAA：只写 IPv4 会被 v6 抢先，必须两族都实测可用且确实更快
-    const better4 = !base4 || !base4.ok || (pin4 && pin4.ip !== base4.ip && pin4.ms < base4.ms * CFG.probe.win_ratio)
-    const better6 = !base6 || !base6.ok || (pin6 && pin6.ip !== base6.ip && pin6.ms < base6.ms * CFG.probe.win_ratio)
-    if (!pin6) reason = '系统有 AAAA，无可用 IPv6 候选，只写 v4 会被抢先 -> 跳过'
-    else if (!pin4) reason = '无可用 IPv4 候选，保持系统 DNS'
-    else if (!(better4 || better6)) reason = '两族现状已是最优'
-    else {
-      use = Object.assign({}, pin4, { also6: pin6.ip })
-      reason = 'v4+v6 同时固定（现状 v4 ' + (base4 ? base4.ms + 'ms' : '不可用') + ' / v6 ' + (base6 ? base6.ms + 'ms' : '不可用') + '）'
-    }
+  // v4 与 v6 各自择优：两族的可用性会随时间互换（同一时刻 Pages 的 v4 全灭而 v6 4.5s 可用），
+  // 写完后由 verify 按真实解析复核，不成立就当场撤销，不做 ::1 沉洞那类取巧。
+  const ratio = CFG.probe.win_ratio
+  const betterThan = function (cand, base) {
+    if (!cand) return false
+    if (!base || !base.ok) return true
+    if (cand.ip === base.ip) return false
+    return cand.ms < base.ms * ratio
   }
-  return { dom, pin4: use ? use.ip : null, pin4ms: use ? use.ms : 0, pin6: use && use.also6 ? use.also6 : null, base4: base4 || null, base6: base6 || null, sysHasV6, reason, tried: res.length, all: res }
+  const take4 = betterThan(pin4, base4) ? pin4 : null
+  const take6 = betterThan(pin6, base6) ? pin6 : null
+  let use = null, reason = ''
+  if (!pin4 && !pin6) reason = '无可用候选，保持系统 DNS'
+  else if (take4 || take6) {
+    use = { ip4: take4 ? take4.ip : null, ip6: take6 ? take6.ip : null, ms: (take4 || take6).ms }
+    reason = 'v4 ' + (base4 ? base4.ms : '不可用') + '→' + (take4 ? take4.ms : '不写') +
+      '，v6 ' + (base6 ? base6.ms : (sysHasV6 ? '不可用' : '无记录')) + '→' + (take6 ? take6.ms : '不写') + 'ms'
+  } else reason = '现状已是最优' + (sysHasV6 ? '（系统 AAAA 可直接用）' : '')
+  return { dom, pin4: use ? use.ip4 : null, pin6: use ? use.ip6 : null, pin4ms: use ? use.ms : 0, base4: base4 || null, base6: base6 || null, sysHasV6, reason, tried: res.length, all: res }
 }
 
 async function verify(dom, canary, expect) {
@@ -220,16 +218,16 @@ async function main() {
     if (CFG.deny.indexOf(dom) >= 0 || !DOMRE.test(dom)) continue
     const conf = CFG.domains[dom] || {}
     const r = await evalDomain(dom, conf, remote)
-    if (r.pin4) chosen.push({ dom, ip: r.pin4, ip6: r.pin6, canary: conf.canary || '/' })
-    report.domains[dom] = { baseline: r.base4, sys_has_aaaa: r.sysHasV6, pinned: r.pin4, pinned6: r.pin6, reason: r.reason, tried: r.tried, probed: r.all }
-    log((r.pin4 ? '固定 ' : '跳过 '), dom.padEnd(28), (r.pin4 || (r.base4 && r.base4.ok ? r.base4.ip : '-')).padEnd(16),
-      String(r.base4 ? r.base4.ms + 'ms' : '无').padEnd(9), String(r.pin4 ? r.pin4ms + 'ms' : '-').padEnd(9), r.reason)
+    if (r.pin4 || r.pin6) chosen.push({ dom, ip: r.pin4, ip6: r.pin6, canary: conf.canary || '/' })
+    report.domains[dom] = { baseline: r.base4, baseline6: r.base6, sys_has_aaaa: r.sysHasV6, pinned: r.pin4, pinned6: r.pin6, reason: r.reason, tried: r.tried, probed: r.all }
+    log((r.pin4 || r.pin6 ? '固定 ' : '跳过 '), dom.padEnd(28), (r.pin4 || r.pin6 || (r.base4 && r.base4.ok ? r.base4.ip : '-')).padEnd(22),
+      String(r.base4 ? r.base4.ms + 'ms' : '无').padEnd(9), String(r.pin4 || r.pin6 ? r.pin4ms + 'ms' : '-').padEnd(9), r.reason)
     if (VERBOSE) for (const p of r.all) log('    ', p.kind.padEnd(6), p.ip.padEnd(22), p.ok ? 'ok ' : 'bad', (String(p.ms) + 'ms').padStart(9), 'code=' + p.code, 'B=' + p.bytes)
   }
   const render = function (list) {
     const lines = []
     for (const c of list.slice(0, CFG.probe.max_entries)) {
-      lines.push(c.ip + '  ' + c.dom)
+      if (c.ip) lines.push(c.ip + '  ' + c.dom)
       if (c.ip6) lines.push(c.ip6 + '  ' + c.dom)
     }
     return [MARK_S, '# 生成时间 ' + new Date().toISOString(), '# 候选来源 GitHub520 + GitHub-IP-hosts + DoH(A/AAAA) + 内置，全部经本机 TLS 实测', lines.join('\r\n'), MARK_E].join('\r\n')
@@ -239,7 +237,7 @@ async function main() {
   // 写入后按真实解析复核：探针可能单轮侥幸通过，落地不成立就当场撤销，不给它活到下一轮的机会
   const failed = []
   for (const c of chosen) {
-    const v = await verify(c.dom, c.canary, c.ip6 ? [c.ip, c.ip6] : [c.ip])
+    const v = await verify(c.dom, c.canary, [c.ip, c.ip6].filter(Boolean))
     log((v.ok ? '生效  ' : '! 撤销 ') + c.dom.padEnd(28) + v.detail)
     if (!v.ok) failed.push(c.dom)
   }
