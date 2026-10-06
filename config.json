@@ -1,0 +1,66 @@
+{
+  "hosts_path": "C:\\Windows\\System32\\drivers\\etc\\hosts",
+  "interval_minutes": 10,
+  "task_name": "QoderAccel",
+  "sources": [
+    "https://cdn.jsdelivr.net/gh/521xueweihan/GitHub520@main/hosts",
+    "https://raw.githubusercontent.com/521xueweihan/GitHub520/main/hosts",
+    "https://cdn.jsdelivr.net/gh/ittuann/GitHub-IP-hosts@main/hosts",
+    "https://raw.githubusercontent.com/ittuann/GitHub-IP-hosts/main/hosts"
+  ],
+  "dns_over_proxy": {
+    "enabled": true,
+    "proxy": "http://127.0.0.1:7897",
+    "doh": "https://cloudflare-dns.com/dns-query?name=DOMAIN"
+  },
+  "probe": {
+    "budget_ms": 8000,
+    "concurrency": 8,
+    "win_ratio": 0.85,
+    "retries": 3,
+    "max_entries": 30,
+    "ok_codes": [200, 206, 301, 302, 404]
+  },
+  "domains": {
+    "api.github.com": { "canary": "/zen" },
+    "raw.githubusercontent.com": { "canary": "/521xueweihan/GitHub520/main/hosts" },
+    "codeload.github.com": { "canary": "/octocat/Hello-World/tar.gz/refs/heads/master" },
+    "objects.githubusercontent.com": { "canary": "/" },
+    "github.githubassets.com": { "canary": "/", "expect": [200] },
+    "avatars.githubusercontent.com": { "canary": "/" },
+    "gist.github.com": { "canary": "/", "expect": [200] },
+    "github.com": { "canary": "/", "expect": [200], "strict": true },
+    "cdn.jsdelivr.net": { "canary": "/npm/react/package.json" },
+    "registry.npmjs.org": { "canary": "/react" }
+  },
+  "static_ips": {
+    "github.com": ["20.205.243.166", "20.205.243.165", "140.82.112.4", "140.82.113.4", "140.82.114.4", "140.82.116.4", "20.29.134.23"],
+    "codeload.github.com": ["20.205.243.165", "20.29.134.24"],
+    "api.github.com": ["20.29.134.17", "140.82.116.6"],
+    "objects.githubusercontent.com": ["185.199.108.133", "185.199.109.133", "185.199.110.133", "185.199.111.133"],
+    "raw.githubusercontent.com": ["185.199.108.133", "185.199.109.133", "185.199.110.133", "185.199.111.133"],
+    "cdn.jsdelivr.net": ["104.16.56.80", "104.16.57.80"]
+  },
+  "static_ips6": {
+    "raw.githubusercontent.com": ["2606:50c0:8000::154", "2606:50c0:8001::154", "2606:50c0:8002::154", "2606:50c0:8003::154", "2606:50c0:8004::154"],
+    "objects.githubusercontent.com": ["2606:50c0:8000::154", "2606:50c0:8001::154", "2606:50c0:8002::154", "2606:50c0:8003::154", "2606:50c0:8004::154"],
+    "avatars.githubusercontent.com": ["2606:50c0:8000::154", "2606:50c0:8001::154", "2606:50c0:8002::154", "2606:50c0:8003::154", "2606:50c0:8004::154"],
+    "github.githubassets.com": ["2606:50c0:8000::154", "2606:50c0:8001::154", "2606:50c0:8002::154", "2606:50c0:8003::154", "2606:50c0:8004::154"]
+  },
+  "deny": [],
+  "proxies": [
+    "https://gh-proxy.com/",
+    "https://ghfast.top/",
+    "https://ghproxy.net/",
+    "https://gitproxy.click/",
+    "https://ghgo.net/",
+    "https://gh.llkk.cc/",
+    "https://github.renfast.net/",
+    "https://gh.aipapi.com/"
+  ],
+  "proxy_canary": "https://raw.githubusercontent.com/521xueweihan/GitHub520/main/hosts",
+  "canary_token": "GitHub520 Host Start",
+  "bulk_canary": "https://github.com/git-lfs/git-lfs/releases/download/v3.6.1/git-lfs-windows-amd64-v3.6.1.zip",
+  "bulk_ms": 6000,
+  "clone_canary": "https://github.com/octocat/Hello-World.git"
+}

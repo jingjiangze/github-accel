@@ -1,0 +1,8 @@
+# 运行期产物，不入库
+logs/
+backups/
+report.json
+proxy-state.json
+run.lock
+.selftest/
+*.part
