@@ -21,6 +21,21 @@
     "max_entries": 30,
     "ok_codes": [200, 206, 301, 302, 404]
   },
+  "proxy_ttl_s": 60,
+  "race": {
+    "max": 3,
+    "first_byte_ms": 4000,
+    "speed_limit_bps": 32768,
+    "speed_time_ms": 5000,
+    "retries_per_entry": 2,
+    "max_time_s": 900,
+    "wall_ms": 300000
+  },
+  "clone": {
+    "same_retry": 2,
+    "low_speed_limit": 1024,
+    "low_speed_time": 20
+  },
   "domains": {
     "api.github.com": { "canary": "/zen" },
     "raw.githubusercontent.com": { "canary": "/521xueweihan/GitHub520/main/hosts" },
