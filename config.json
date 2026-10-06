@@ -58,6 +58,12 @@
     "https://github.renfast.net/",
     "https://gh.aipapi.com/"
   ],
+  "relay": {
+    "enabled": true,
+    "base": "https://gh-accel-relay.pages.dev/r/KEY/",
+    "key_file": "relay-key",
+    "key_env": "GH_ACCEL_RELAY_KEY"
+  },
   "proxy_canary": "https://raw.githubusercontent.com/521xueweihan/GitHub520/main/hosts",
   "canary_token": "GitHub520 Host Start",
   "bulk_canary": "https://github.com/git-lfs/git-lfs/releases/download/v3.6.1/git-lfs-windows-amd64-v3.6.1.zip",
