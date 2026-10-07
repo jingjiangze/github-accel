@@ -19,9 +19,19 @@
     "win_ratio": 0.85,
     "retries": 3,
     "max_entries": 30,
-    "ok_codes": [200, 206, 301, 302, 404]
+    "ok_codes": [200, 206, 301, 302, 404],
+    "min_bytes": 1
   },
   "proxy_ttl_s": 60,
+  "proxy_probe_concurrency": 4,
+  "proxy_history_samples": 12,
+  "proxy_score_weights": { "stability": 30, "speed_p50": 25, "speed_p10": 15, "latency": 15, "fail_rate": 10, "freshness": 5 },
+  "proxy_cooldown": { "tier1_fails": 3, "tier1_ms": 1800000, "tier2_fails": 5, "tier2_ms": 7200000, "tier3_fails": 8, "tier3_ms": 86400000 },
+  "proxy_freshness_ms": 3600000,
+  "proxy_race_diversity": true,
+  "fake_ip_ranges4": ["198.18.0.0/16"],
+  "fake_ip_ranges6": ["fdfe:dcba:9876::/64"],
+  "fake_ip_probe_domain": "www.example.com",
   "race": {
     "max": 3,
     "first_byte_ms": 4000,
@@ -44,7 +54,7 @@
     "github.githubassets.com": { "canary": "/", "expect": [200] },
     "avatars.githubusercontent.com": { "canary": "/" },
     "gist.github.com": { "canary": "/", "expect": [200] },
-    "github.com": { "canary": "/", "expect": [200], "strict": true },
+    "github.com": { "canary": "/", "expect": [200], "strict": true, "min_bytes": 8192, "max_ms": 4000 },
     "cdn.jsdelivr.net": { "canary": "/npm/react/package.json" },
     "registry.npmjs.org": { "canary": "/react" }
   },
@@ -61,6 +71,13 @@
     "objects.githubusercontent.com": ["2606:50c0:8000::154", "2606:50c0:8001::154", "2606:50c0:8002::154", "2606:50c0:8003::154", "2606:50c0:8004::154"],
     "avatars.githubusercontent.com": ["2606:50c0:8000::154", "2606:50c0:8001::154", "2606:50c0:8002::154", "2606:50c0:8003::154", "2606:50c0:8004::154"],
     "github.githubassets.com": ["2606:50c0:8000::154", "2606:50c0:8001::154", "2606:50c0:8002::154", "2606:50c0:8003::154", "2606:50c0:8004::154"]
+  },
+  "proxy_gate": {
+    "enabled": true,
+    "proxy": "http://127.0.0.1:7897",
+    "test_url": "https://github.com/",
+    "timeout_ms": 8000,
+    "handoff_domains": ["github.com", "gist.github.com"]
   },
   "deny": [],
   "proxies": [
@@ -83,5 +100,7 @@
   "canary_token": "GitHub520 Host Start",
   "bulk_canary": "https://github.com/git-lfs/git-lfs/releases/download/v3.6.1/git-lfs-windows-amd64-v3.6.1.zip",
   "bulk_ms": 6000,
+  "bulk_min_bytes": 262144,
+  "bulk_min_bps": 131072,
   "clone_canary": "https://github.com/octocat/Hello-World.git"
 }

@@ -6,6 +6,9 @@ const ALLOW = new Set([
   'raw.githubusercontent.com',
   'codeload.github.com',
   'objects.githubusercontent.com',
+  // release 资产经常 302 到这里，缺了它 /releases/download 会在跳转终点被 403 卡住
+  'release-assets.githubusercontent.com',
+  'github-cloud.githubusercontent.com',
   'gist.github.com',
   'gist.githubusercontent.com',
   'avatars.githubusercontent.com',
@@ -17,6 +20,12 @@ const ALLOW = new Set([
   'desktop.githubusercontent.com',
   'notebook.githubusercontent.com'
 ])
+// 跳转链上每一跳都要重新过白名单：redirect:'follow' 只验证了第一跳
+const MAX_HOPS = 5
+// 请求侧必须透传的条件头：少了 Range，客户端设计好的"停滞换源续传"在 relay 上会退化成从 0 重下
+const REQ_PASS = ['range', 'if-range', 'if-none-match', 'if-modified-since', 'cache-control']
+// 响应侧对应的分片/缓存头，不透传客户端就无法断点续传、也无法正确缓存
+const RES_PASS = ['content-range', 'accept-ranges', 'content-disposition', 'content-encoding']
 
 function bad(status, why) {
   return new Response(why, { status, headers: { 'content-type': 'text/plain; charset=utf-8', 'cache-control': 'no-store' } })
@@ -32,6 +41,13 @@ function same(a, b) {
   return diff === 0
 }
 
+function allowed(u) {
+  try {
+    const t = new URL(u)
+    return t.protocol === 'https:' && ALLOW.has(t.hostname.toLowerCase())
+  } catch (e) { return false }
+}
+
 export async function onRequest(ctx) {
   const { request, env } = ctx
   const key = env.RELAY_KEY
@@ -45,7 +61,7 @@ export async function onRequest(ctx) {
 
   let target
   try { target = new URL(m[1] + u.search) } catch (e) { return bad(400, 'bad target') }
-  if (target.protocol !== 'https:' || !ALLOW.has(target.hostname.toLowerCase())) return bad(403, 'host not allowed')
+  if (!allowed(target.toString())) return bad(403, 'host not allowed')
 
   const H = new Headers()
   // 保留客户端 UA：GitHub 靠 git/* 的 User-Agent 决定回 pkt-line 还是 HTML 页，
@@ -53,6 +69,10 @@ export async function onRequest(ctx) {
   H.set('user-agent', request.headers.get('user-agent') || 'git/2.50.0')
   H.set('accept-encoding', 'identity')
   H.set('accept', request.headers.get('accept') || '*/*')
+  for (const name of REQ_PASS) {
+    const v = request.headers.get(name)
+    if (v) H.set(name, v)
+  }
   if (request.method === 'POST') {
     const ct = request.headers.get('content-type'); if (ct) H.set('content-type', ct)
     const ce = request.headers.get('content-encoding'); if (ce) H.set('content-encoding', ce)
@@ -62,16 +82,32 @@ export async function onRequest(ctx) {
     if (auth) H.set('authorization', auth)
   }
 
+  // 手动跟跳：每一跳都重新校验 host，最多 MAX_HOPS 跳，超出即拒。
+  // 这样既支持 release 资产的正常跳转，也不会把 relay 变成"允许重定向的开放代理"。
+  let hopUrl = target.toString()
   let up
-  try {
-    up = await fetch(target.toString(), {
-      method: request.method,
-      headers: H,
-      redirect: 'follow',
-      body: request.method === 'POST' ? request.body : undefined
-    })
-  } catch (e) {
-    return bad(502, 'upstream fetch failed')
+  for (let hop = 0; ; hop++) {
+    if (!allowed(hopUrl)) return bad(403, 'host not allowed')
+    try {
+      up = await fetch(hopUrl, {
+        method: request.method,
+        headers: H,
+        redirect: 'manual',
+        body: request.method === 'POST' ? request.body : undefined
+      })
+    } catch (e) {
+      return bad(502, 'upstream fetch failed')
+    }
+    if (up.status < 300 || up.status >= 400) break
+    const loc = up.headers.get('location')
+    if (!loc) break
+    if (hop >= MAX_HOPS) return bad(508, 'too many redirects')
+    let next
+    try { next = new URL(loc, hopUrl).toString() } catch (e) { return bad(502, 'bad redirect location') }
+    if (!allowed(next)) return bad(403, 'redirect host not allowed: ' + new URL(next).hostname)
+    // 3xx 的 body 对客户端无用，先释放
+    try { await up.body.cancel() } catch (e) {}
+    hopUrl = next
   }
 
   const out = new Headers()
@@ -80,6 +116,10 @@ export async function onRequest(ctx) {
   const cc = up.headers.get('cache-control'); out.set('cache-control', cc || 'public, max-age=300')
   const et = up.headers.get('etag'); if (et) out.set('etag', et)
   const last = up.headers.get('last-modified'); if (last) out.set('last-modified', last)
-  out.set('x-relay-target', target.hostname)
+  for (const name of RES_PASS) {
+    const v = up.headers.get(name)
+    if (v) out.set(name, v)
+  }
+  out.set('x-relay-target', new URL(hopUrl).hostname)
   return new Response(up.body, { status: up.status, statusText: up.statusText, headers: out })
 }
