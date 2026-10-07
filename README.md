@@ -63,7 +63,8 @@ schtasks /delete /tn QoderAccel /f
 - `probe.retries` / `budget_ms`：每 IP 探测轮数与单轮上限。
 - `probe.min_bytes`：全局默认的最小取回体积（默认 1），按域可用 `domains.<域>.min_bytes` 覆盖。
 - `deny`：永不固定的域名。
-- `proxies`：公开反代入口清单，`gh.mjs doctor --force` 重新体检。
+- `proxies`：主入口清单，每轮体检都会测。`gh.mjs doctor --force` 重新体检。
+- `proxies_explore`：候选池，只做**低频测量、不参与竞速**（它的样本可能是一小时前的，拿它选路等于用陈旧数据）。`proxy_explore_every` 控制节奏（默认 6 轮 ≈ 1 小时）；`doctor --explore` 可强制探一次，测出可用的会点名提示你加进 `proxies`。
 - `proxy_ttl_s`：入口体检缓存（默认 60 秒）。
 - `proxy_probe_concurrency`：入口体检并发数（默认 4）。
 - `proxy_history_samples`：每个入口保留多少轮历史样本，用于算稳定性/分位数。
@@ -131,6 +132,11 @@ npx wrangler pages deploy --branch main
 再取"最稳 / 本轮最快 / 样本最少的探索位"三路并尽量落在不同 host 上——避免三个入口同属一个故障域。
 这正是"体检排名"和"长期可用"会分叉的地方：入口 A 跑出 3.7/2.4/6.1 MB/s，入口 B 稳定在 3.0/3.2/3.1 MB/s，
 只看最近一次 A 赢，长期看 B 才该排前面。
+
+2026-10-07 实测（18 个候选入口，各 3 轮）：只有 `ghfast.top`、`gh-proxy.com`、`ghproxy.net` 过了内容级体检。
+其余要么连接失败（`code=0`，多数是 4 秒内直接连不上），要么回了 `200` 却没有约定内容
+（`gitproxy.click`、`gh-proxy.net` 这类——正是"只看状态码会被骗"的例子），`ghgo.net` 回的是 `468`。
+所以主清单精简成这 3 个加自建 relay，死掉的那批移进 `proxies_explore` 低频复查，不再每轮都去撞。
 
 `clone` 同源问题：GitHub 按 `User-Agent` 决定回 pkt-line 还是 HTML，所以先**并发探**
 `info/refs` 只留真 pkt-line 的入口，再克隆；schannel 随机握手失败（实测约 1/3 概率）会原地重试一次

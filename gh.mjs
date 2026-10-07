@@ -97,11 +97,19 @@ function relayReal() {
 function isRelay(p) { return p === RELAY_ALIAS || (!!RELAY_REAL && p === RELAY_REAL) }
 function maskPrefix(p) { return isRelay(p) ? String(CFG.relay.base).replace('KEY', '<REDACTED>') : p }
 function label(p) { return isRelay(p) ? 'relay:' + hostOf(CFG.relay.base) : hostOf(p) }
-function entryDefs() {
-  const list = (CFG.proxies || []).map(function (p) { return { key: p, prefix: p } })
+function entryDefs(includeExplore) {
+  const list = (CFG.proxies || []).map(function (p) { return { key: p, prefix: p, tier: 'core' } })
   const rp = relayReal()
-  if (rp) list.unshift({ key: RELAY_ALIAS, prefix: rp })
+  if (rp) list.unshift({ key: RELAY_ALIAS, prefix: rp, tier: 'core' })
+  // 候选池只做低频测量，不参与竞速：它的样本可能是一小时前的，拿它选路等于用陈旧数据
+  if (includeExplore) for (const p of (CFG.proxies_explore || [])) list.push({ key: p, prefix: p, tier: 'explore' })
   return list
+}
+// 候选池每 N 轮探一次（默认 6 轮 ≈ 1 小时，按 10 分钟一轮算）
+function exploreDue(st) {
+  const every = CFG.proxy_explore_every || 6
+  if (every <= 0) return false
+  return (((st && st.round) || 0) % every) === 0
 }
 // 状态文件里存的是别名；读取时再换回真实前缀，旧格式（直接存了真实 URL）顺手迁移
 function resolveEntries(entries) {
@@ -210,21 +218,24 @@ async function checkOne(def) {
 function loadState() {
   try { return JSON.parse(fs.readFileSync(STATE, 'utf8')) } catch (e) { return null }
 }
-async function checkAll(force) {
+async function checkAll(force, withExplore) {
   const st = loadState()
   const fresh = st && Date.now() - st.at < TTL && (st.entries || []).some(function (e) { return e.ok || e.soft })
   if (fresh && !force) return st
   const prevByKey = new Map()
   for (const e of (st && st.entries) || []) prevByKey.set(e.prefix, e)
   const now = Date.now()
-  const entries = await pool(entryDefs(), CFG.proxy_probe_concurrency || 4, async function (d) {
+  const round = ((st && st.round) || 0) + 1
+  const wantExplore = !!withExplore || exploreDue(st)
+  const entries = await pool(entryDefs(wantExplore), CFG.proxy_probe_concurrency || 4, async function (d) {
     const r = await checkOne(d)
+    r.tier = d.tier
     r.hist = mergeHist(prevByKey.get(d.key), r, now)
     return r
   })
   // 评分是整组相对量（按当前候选集归一化），所以在这里算完一起落盘，
   // 免得下游（accel 的 report.json、list）只能看到 undefined
-  const out = { v: 2, at: now, target: CFG.proxy_canary, entries: scoreAll(entries, now) }
+  const out = { v: 2, at: now, round: round, explore: wantExplore, target: CFG.proxy_canary, entries: scoreAll(entries, now) }
   fs.writeFileSync(STATE, JSON.stringify(out, null, 1))
   return out
 }
@@ -244,7 +255,7 @@ function order(st) {
 // strict=true 只认过了带宽门槛的；带宽门槛全灭时退化为"仅内容标记可用"，别让竞速直接无入口
 function pickRacers(st, n, strict) {
   const now = Date.now()
-  const ok = order(st).filter(function (e) { return strict === false ? (e.ok || e.soft) : e.ok })
+  const ok = order(st).filter(function (e) { return (strict === false ? (e.ok || e.soft) : e.ok) && e.tier !== 'explore' })
   const usable = ok.filter(function (e) { return !inCooldown(e, now) })
   const base = usable.length ? usable : ok
   if (!CFG.proxy_race_diversity) return base.slice(0, n)
@@ -411,21 +422,31 @@ async function clone(args) {
   console.error('全部入口失败'); process.exit(4)
 }
 
-async function doctor(show) {
-  const st = await checkAll(show)
+async function doctor(show, explore) {
+  const st = await checkAll(show, explore)
   const now = Date.now()
-  console.log('入口体检 @ ' + new Date(st.at).toLocaleString() + '  目标 ' + st.target + (show ? '' : '  (缓存 ' + (CFG.proxy_ttl_s || 60) + 's)'))
-  for (const e of order(st)) console.log('  ' + (e.ok ? 'OK  ' : (e.soft ? 'SOFT' : 'DEAD')) + ' ' + maskPrefix(e.prefix).padEnd(46) +
+  console.log('入口体检 @ ' + new Date(st.at).toLocaleString() + '  第 ' + st.round + ' 轮' + (st.explore ? '（含候选池）' : '') +
+    '  目标 ' + st.target + (show ? '' : '  (缓存 ' + (CFG.proxy_ttl_s || 60) + 's)'))
+  for (const e of order(st)) console.log('  ' + (e.ok ? 'OK  ' : (e.soft ? 'SOFT' : 'DEAD')) + ' ' + (e.tier === 'explore' ? '[候]' : '[主]') + ' ' +
+    maskPrefix(e.prefix).padEnd(46) +
     (e.ms === 1e9 ? '     -' : (String(e.ms) + 'ms').padStart(7)) +
     '  实测 ' + mbps(e.bps || 0).padStart(6) + ' MB/s  评分 ' + String(e.score || 0).padStart(5) +
     ' code=' + e.code + '/' + e.bulk_code + ' 样本=' + (e.bulk_bytes || 0) +
     (inCooldown(e, now) ? '  [冷却中]' : ''))
+  // 候选池里翻身的入口不会自动进主清单（改 config 属于用户的决定），这里点名提示
+  if (st.explore) {
+    const promoted = order(st).filter(function (e) { return e.tier === 'explore' && e.ok })
+    console.log(promoted.length
+      ? '  候选池本轮可用：' + promoted.map(function (e) { return maskPrefix(e.prefix) + '（' + mbps(e.bps || 0) + ' MB/s）' }).join('、') +
+        '  —— 想启用请加进 config.json 的 proxies'
+      : '  候选池本轮无可用入口')
+  }
 }
 function list() {
   try {
     const now = Date.now()
-    for (const e of order(loadState())) console.log((e.ok ? 'OK   ' : (e.soft ? 'SOFT ' : 'DEAD ')) + maskPrefix(e.prefix).padEnd(46) +
-      '  ' + mbps(e.bps || 0) + ' MB/s  评分 ' + (e.score || 0) + (inCooldown(e, now) ? '  [冷却中]' : ''))
+    for (const e of order(loadState())) console.log((e.ok ? 'OK   ' : (e.soft ? 'SOFT ' : 'DEAD ')) + (e.tier === 'explore' ? '[候]' : '[主]') + ' ' +
+      maskPrefix(e.prefix).padEnd(46) + '  ' + mbps(e.bps || 0) + ' MB/s  评分 ' + (e.score || 0) + (inCooldown(e, now) ? '  [冷却中]' : ''))
   } catch (e) { console.log('无体检记录，先跑 node gh.mjs doctor') }
 }
 
@@ -494,13 +515,24 @@ if (SELFTEST) {
   } else {
     console.log('  SKIP  未配置 relay-key，跳过旧格式迁移用例')
   }
+  // 候选池（explore）只做低频测量，不参与竞速——它的样本可能是一小时前的
+  const stz = { entries: [
+    { prefix: 'https://core/', ok: true, bps: 100, ms: 10, tier: 'core', hist: { samples: 3, ok_count: 3, fail_streak: 0, speeds: [100], lats: [10] } },
+    { prefix: 'https://exp/', ok: true, bps: 9999, ms: 5, tier: 'explore', hist: { samples: 3, ok_count: 3, fail_streak: 0, speeds: [9999], lats: [5] } }
+  ] }
+  const pz = pickRacers(stz, 3)
+  T('候选池即使更快也不参与竞速', pz.length === 1 && pz[0].prefix === 'https://core/', true)
+  // 候选池探测节奏：无状态时先探一次（做初始发现），之后每 N 轮一次
+  T('首轮探候选池', exploreDue(null), true)
+  T('第 1 轮不探候选池', exploreDue({ round: 1 }), false)
+  T('第 6 轮探候选池', exploreDue({ round: 6 }), true)
   console.log(bad ? '  自测失败 ' + bad + ' 项' : '  自测全部通过')
   process.exit(bad ? 1 : 0)
 }
 
 const a = ARGV[0]
-if (!a) console.log(['用法:', '  node gh.mjs <github-url> [输出文件名]', '  node gh.mjs clone [git clone 参数...] <repo-url>', '  node gh.mjs doctor --force', '  node gh.mjs list', '  node gh.mjs --selftest', '说明: 竞速选路，不依赖上次测速结果；只取 GitHub 域，带凭据的地址一律拒绝外送'].join('\n'))
-else if (a === 'doctor') await doctor(ARGV.includes('--force'))
+if (!a) console.log(['用法:', '  node gh.mjs <github-url> [输出文件名]', '  node gh.mjs clone [git clone 参数...] <repo-url>', '  node gh.mjs doctor --force [--explore]', '  node gh.mjs list', '  node gh.mjs --selftest', '说明: 竞速选路，不依赖上次测速结果；只取 GitHub 域，带凭据的地址一律拒绝外送'].join('\n'))
+else if (a === 'doctor') await doctor(ARGV.includes('--force'), ARGV.includes('--explore'))
 else if (a === 'list') list()
 else if (a === 'clone') await clone(ARGV.slice(1))
 else if (/^https?:\/\//.test(a)) await race(a, ARGV[1] || decodeURIComponent(a.split('/').pop().split('?')[0]) || 'download.bin')

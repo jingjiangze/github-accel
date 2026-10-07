@@ -29,6 +29,7 @@
   "proxy_cooldown": { "tier1_fails": 3, "tier1_ms": 1800000, "tier2_fails": 5, "tier2_ms": 7200000, "tier3_fails": 8, "tier3_ms": 86400000 },
   "proxy_freshness_ms": 3600000,
   "proxy_race_diversity": true,
+  "proxy_explore_every": 6,
   "fake_ip_ranges4": ["198.18.0.0/16"],
   "fake_ip_ranges6": ["fdfe:dcba:9876::/64"],
   "fake_ip_probe_domain": "www.example.com",
@@ -83,12 +84,24 @@
   "proxies": [
     "https://gh-proxy.com/",
     "https://ghfast.top/",
-    "https://ghproxy.net/",
+    "https://ghproxy.net/"
+  ],
+  "proxies_explore": [
     "https://gitproxy.click/",
     "https://ghgo.net/",
     "https://gh.llkk.cc/",
     "https://github.renfast.net/",
-    "https://gh.aipapi.com/"
+    "https://gh.aipapi.com/",
+    "https://ghproxy.cc/",
+    "https://hub.gitmirror.com/",
+    "https://github.moeyy.xyz/",
+    "https://ghp.ci/",
+    "https://ghps.cc/",
+    "https://gh.api.99988866.xyz/",
+    "https://gh.con.sh/",
+    "https://gh-proxy.net/",
+    "https://cdn.gh-proxy.com/",
+    "https://ghproxy.link/"
   ],
   "relay": {
     "enabled": true,
