@@ -4,8 +4,11 @@ import path from 'node:path'
 import { execFile } from 'node:child_process'
 import { fileURLToPath } from 'node:url'
 import { promises as dnsp } from 'node:dns'
+import { open as openPool } from './pool.mjs'
 
 const HERE = path.dirname(fileURLToPath(import.meta.url))
+// 候选健康池（pool.mjs）：每轮只探一小撮，探完写回历史。未启用时为 null，走旧的候选来源。
+let POOL = null
 const CFG = JSON.parse(fs.readFileSync(path.join(HERE, 'config.json'), 'utf8'))
 const MARK_S = '# >>> accel-start >>> 本机实测自动生成，请勿手工编辑'
 const MARK_E = '# <<< accel-end <<<'
@@ -287,8 +290,16 @@ function pickPins(pin4, pin6, base4, base6, sysHasV6, ratio) {
 async function evalDomain(dom, conf, remote) {
   const canary = conf.canary || '/'
   const cand = new Set()
-  if (remote[dom]) for (const ip of remote[dom]) if (fam(ip) && (!conf.family || fam(ip) === conf.family)) cand.add(ip)
-  for (const ip of ((CFG.static_ips || {})[dom] || []).concat((CFG.static_ips6 || {})[dom] || [])) if (fam(ip) && (!conf.family || fam(ip) === conf.family)) cand.add(ip)
+  const srcOf = {}
+  // 候选从哪来：有健康池就走池子（每轮只探 probe_per_round 个，exploit + explore），
+  // 没有就退回旧来源。旧的 static_ips / 第三方列表正是审计要摆脱的"过期候选集"。
+  if (POOL && POOL.on) {
+    for (const p of POOL.probes(dom, (CFG.pool && CFG.pool.probe_per_round) || 8)) { cand.add(p.ip); srcOf[p.ip] = p.src }
+  } else {
+    if (remote[dom]) for (const ip of remote[dom]) if (fam(ip) && (!conf.family || fam(ip) === conf.family)) cand.add(ip)
+    for (const ip of ((CFG.static_ips || {})[dom] || []).concat((CFG.static_ips6 || {})[dom] || [])) if (fam(ip) && (!conf.family || fam(ip) === conf.family)) cand.add(ip)
+  }
+  // 实时解析仍然每轮取一次：线路变化时它是最快的信号，也是池子里 explore 的主要来源
   for (const ip of await dohResolve(dom, 'A')) cand.add(ip)
   const v6 = await dohResolve(dom, 'AAAA')
   if (v6.length) for (const ip of v6) cand.add(ip)
@@ -302,6 +313,16 @@ async function evalDomain(dom, conf, remote) {
     const r = await probe(dom, j.ip, canary)
     return { ip: j.ip, kind: j.kind, fam: fam(j.ip), ok: r.ok, ms: r.ms, code: r.code, bytes: r.bytes }
   })
+  // 观测写回池子（含 baseline：系统解析答案本身好不好用也是有用信息）
+  if (POOL && POOL.on) {
+    const minSpeedBytes = (CFG.pool && CFG.pool.speed_min_bytes) || 65536
+    for (const x of res) {
+      // 速度直接从已有探测的 bytes/ms 推导，不额外下载；只有响应体够大才计入，
+      // 否则小响应测出来的"速度"其实是延迟倒数
+      const speed = (x.ok && x.bytes >= minSpeedBytes && x.ms > 0) ? Math.round(x.bytes / (x.ms / 1000)) : 0
+      POOL.record(dom, x.ip, { ok: x.ok, ms: x.ms, code: x.code, speed: speed, src: srcOf[x.ip] || (x.kind === 'base4' || x.kind === 'base6' ? 'system-dns' : '') })
+    }
+  }
   const byFam = function (f) { return res.filter(function (x) { return x.fam === f }).slice().sort(function (a, b) { return a.ms - b.ms }) }
   const g4 = byFam(4).filter(function (x) { return x.ok })
   const g6 = byFam(6).filter(function (x) { return x.ok })
@@ -380,8 +401,25 @@ async function main() {
     log('==== 本轮跳过：hosts 层被架空，保留现有固定，不写也不撤（report.json 留上一轮） ====')
     return
   }
-  const remote = await loadRemoteCandidates()
-  const report = { at: new Date().toISOString(), env, domains: {} }
+  // 候选过期就顺手刷新一次（discover 自己也会判有效期；这里保证它不会永远不跑）。
+  // dry-run 跳过：discover 会写 candidates.json，只读轮次不能有副作用。
+  if (!DRY && CFG.discovery && CFG.discovery.enabled) {
+    const cj = path.join(HERE, 'candidates.json')
+    let at = 0
+    try { at = JSON.parse(fs.readFileSync(cj, 'utf8')).at } catch (e) {}
+    if (Date.now() - at > (CFG.discovery.refresh_h || 6) * 3600e3) {
+      log('候选发现：开始刷新（candidates.json 已过期）')
+      const r = await run(process.execPath, [path.join(HERE, 'discover.mjs')], 300000)
+      log('候选发现：' + (r.code === 0 ? '已刷新' : '未完成 code=' + r.code))
+    }
+  }
+  POOL = openPool(CFG)
+  // 池子启用时不再每轮抓第三方列表：候选已经在 candidates.json 里，且它只当 hint
+  const remote = POOL.on ? {} : await loadRemoteCandidates()
+  log(POOL.on
+    ? '候选池已启用：每域每轮探 ' + ((CFG.pool && CFG.pool.probe_per_round) || 8) + ' 个（exploit + explore）'
+    : '候选池未启用（缺 candidates.json 或 pool.enabled=false），本轮沿用旧候选来源')
+  const report = { at: new Date().toISOString(), env, pool: { enabled: POOL.on }, domains: {} }
   const chosen = []
   for (const dom of Object.keys(CFG.domains)) {
     if (CFG.deny.indexOf(dom) >= 0 || !DOMRE.test(dom)) continue
@@ -458,6 +496,18 @@ async function main() {
     log('入口体检：' + report.proxies.entries.filter(function (x) { return x.ok }).length + ' 可用 / ' + report.proxies.entries.length + ' 已测')
     if (VERBOSE) for (const line of String(d.stdout).split(/\r?\n/).slice(1)) log('    ', line)
   } catch (e) { log('入口体检未完成：' + ((e && e.message) || e)) }
+  // 观测落盘。dry-run 是只读：内存里记录过但不写盘
+  if (POOL && POOL.on && !DRY) {
+    POOL.save()
+    const tot = { active: 0, reserve: 0, explorer: 0, quarantine: 0 }
+    for (const d of Object.keys(CFG.domains)) {
+      const b = POOL.buckets(d)
+      tot.active += b.active.length; tot.reserve += b.reserve.length
+      tot.explorer += b.explorer.length; tot.quarantine += b.quarantine.length
+    }
+    report.pool = Object.assign({ enabled: true }, tot)
+    log('候选池：active ' + tot.active + ' / reserve ' + tot.reserve + ' / explorer ' + tot.explorer + ' / quarantine ' + tot.quarantine)
+  }
   fs.writeFileSync(path.join(HERE, 'report.json'), JSON.stringify(report, null, 1))
   log('==== 完成' + (DRY ? '（dry-run，未动文件）' : '') + '：评估 ' + Object.keys(report.domains).length + ' 域，' +
     (DRY ? '拟固定 ' + chosen.length : '保留 ' + (chosen.length - failed.length)) + ' 条固定，撤销 ' + failed.length + ' 条，报告 report.json ====')

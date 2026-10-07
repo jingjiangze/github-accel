@@ -37,6 +37,8 @@ node gh.mjs clone --depth 1 https://github.com/octocat/Hello-World.git
 :: 离线自测（不联网、不落盘）
 node accel.mjs --selftest
 node gh.mjs --selftest
+node pool.mjs --selftest
+node discover.mjs --selftest
 node relay/test/middleware.test.mjs
 
 :: 回滚
@@ -53,11 +55,51 @@ schtasks /delete /tn QoderAccel /f
 3. **只写 IPv4 的 hosts 会被 AAAA 抢先**。给 `raw.githubusercontent.com` 固定 IPv4 后，真实请求仍走 `2606:50c0:8003::154` 并超时。本工具因此对候选同时探 A/AAAA 记录，两族都实测可用才写，否则跳过。
 4. **反代入口需要内容级体检**。仅看 HTTP 200 会把自建拦截页当"通"（某入口对 2.4KB 样本回 200 但只有 543 字节的错误页，另一入口小文件正常、5MB 样本直接断流）。`gh.mjs doctor` 用固定内容标记 + 大文件带宽样本两级判定，并按 MB/s 排序选路。
 
+## 候选从哪来：发现（`discover.mjs`）+ 健康池（`pool.mjs`）
+
+早期版本把候选 IP 写死在 `config.json` 的 `static_ips`，每轮再把第三方列表里的所有 IP 探一遍。两个问题：
+列表会过期（同一份 GitHub520 换条线路结论就变），而且每轮都从头随机——昨天好用的 IP 今天可能连试都不试。
+
+现在分两层：
+
+**发现层**（`discover.mjs`，默认 6 小时刷一次，`accel.mjs` 到期自动触发）
+
+| 来源 | 用途 | 传输 |
+|---|---|---|
+| GitHub `GET /meta` | 按服务（web / api / git / pages）取官方 CIDR，每个 /24 抽一个样本 | **必须直连**——实测经代理 403（CF 出口被 GitHub 拉黑） |
+| Cloudflare `ips-v4` / `ips-v6` | 给 CF 前置的域（jsDelivr、npm registry） | 直连 |
+| 多 DoH（Cloudflare + Google） | 当前真实 A/AAAA 答案，配额不够时优先保它 | 经代理 |
+| GitHub520 / GitHub-IP-hosts | **只当 hint**，不直接写 hosts | 直连 |
+
+产物是 `candidates.json`。官方网段只做抽样、不扫全段——这是 CloudflareSpeedTest 控成本的做法。
+每个源都带自己的 `via`（direct / proxy），因为"哪个源能走哪条路"在本机并不一致。
+
+**健康池**（`pool.mjs` → `pool-state.json`）：每个（域，IP）留历史样本，按
+可用率 35 + 延迟P50 20 + 延迟P95 10 + 速度P50 20 + 速度P10 5 + 抖动 5 + 新鲜度 5 评分，
+再分进 active / reserve / explorer / quarantine 四个桶（连续失败 3 / 5 / 8 次 → 30 分钟 / 2 小时 / 24 小时冷却）。
+
+每轮只探 `pool.probe_per_round`（默认 8）个：其中 `explore_ratio`（默认 15%）留给没试过的，其余给历史好的；
+同 /24（v6 同 /64）最多 `max_per_prefix`（默认 2）个，避免一撮候选落在同一个故障域。
+速度直接从已有探测的 `bytes/ms` 推导、不额外下载，且只有响应体 ≥ `speed_min_bytes`（默认 64 KiB）才计入——
+小响应算出来的"速度"其实是延迟倒数。
+
+```bat
+node discover.mjs --force -v      :: 手动刷新候选
+node pool.mjs show                :: 看各域分桶与评分
+node pool.mjs show github.com     :: 只看某个域
+```
+
+`--dry` 不触发发现、也不写池子（严格只读）。
+
 ## 用法与配置
 
 `config.json` 的关键项：
 
-- `sources`：候选 IP 列表源，jsDelivr 优先、`raw.githubusercontent.com` 兜底（实测后者会间歇 5xx/超时）。
+- `discovery`：候选发现——各来源的 URL 与 `via`（`direct`/`proxy`）、`refresh_h`（默认 6 小时）、
+  `sample_per_24`（每个 /24 抽几个）、`max_per_domain`、`cf_domains`（CF 前置的域）、`gh_domains`（域 → GitHub 服务名）。
+- `pool`：健康池——`probe_per_round`（每轮每域探几个）、`explore_ratio`、`min_samples`、`max_per_prefix`、
+  `history_samples`、`active_ok_rate`、`score_weights`、`cooldown`、`speed_min_bytes`。
+- `sources`：候选 IP 列表源，jsDelivr 优先、`raw.githubusercontent.com` 兜底（实测后者会间歇 5xx/超时）。现在只当 hint。
 - `domains`：每个域名的探测路径 `canary`、可接受状态码 `expect`、`strict`（多轮必须全通过）、`min_bytes`（取回多少字节才算真拿到，`github.com` 设 8192 以排除"200 + 头几 KB 后卡死"的假健康节点）、`max_ms`（慢到离谱的候选直接不写，`github.com` 设 4000）。`github.com` 必须 `strict`。
 - `probe.win_ratio`：比现状快多少才写入（默认 0.85，即至少快 15%）。
 - `probe.retries` / `budget_ms`：每 IP 探测轮数与单轮上限。

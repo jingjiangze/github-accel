@@ -8,6 +8,30 @@
     "https://cdn.jsdelivr.net/gh/ittuann/GitHub-IP-hosts@main/hosts",
     "https://raw.githubusercontent.com/ittuann/GitHub-IP-hosts/main/hosts"
   ],
+  "discovery": {
+    "enabled": true,
+    "refresh_h": 6,
+    "proxy": "http://127.0.0.1:7897",
+    "github_meta": { "url": "https://api.github.com/meta", "via": "direct" },
+    "cf_ips4": { "url": "https://www.cloudflare.com/ips-v4", "via": "direct" },
+    "cf_ips6": { "url": "https://www.cloudflare.com/ips-v6", "via": "direct" },
+    "doh": [
+      { "url": "https://cloudflare-dns.com/dns-query?name=DOMAIN&type=TYPE", "via": "proxy", "header": "accept: application/dns-json" },
+      { "url": "https://dns.google/resolve?name=DOMAIN&type=TYPE", "via": "proxy" }
+    ],
+    "sample_per_24": 1,
+    "max_per_domain": 64,
+    "cf_domains": ["cdn.jsdelivr.net", "registry.npmjs.org"],
+    "gh_domains": {
+      "github.com": ["web"],
+      "api.github.com": ["api", "web"],
+      "codeload.github.com": ["git", "web"],
+      "raw.githubusercontent.com": ["pages"],
+      "objects.githubusercontent.com": ["pages"],
+      "avatars.githubusercontent.com": ["pages"],
+      "github.githubassets.com": ["pages"]
+    }
+  },
   "dns_over_proxy": {
     "enabled": true,
     "proxy": "http://127.0.0.1:7897",
@@ -30,6 +54,21 @@
   "proxy_freshness_ms": 3600000,
   "proxy_race_diversity": true,
   "proxy_explore_every": 6,
+  "pool": {
+    "enabled": true,
+    "probe_per_round": 8,
+    "explore_ratio": 0.15,
+    "min_samples": 2,
+    "max_per_prefix": 2,
+    "history_samples": 16,
+    "active_ok_rate": 0.6,
+    "freshness_ms": 3600000,
+    "speed_every_rounds": 6,
+    "speed_top_n": 4,
+    "speed_min_bytes": 65536,
+    "score_weights": { "available": 35, "lat_p50": 20, "lat_p95": 10, "speed_p50": 20, "speed_p10": 5, "jitter": 5, "freshness": 5 },
+    "cooldown": { "tier1_fails": 3, "tier1_ms": 1800000, "tier2_fails": 5, "tier2_ms": 7200000, "tier3_fails": 8, "tier3_ms": 86400000 }
+  },
   "fake_ip_ranges4": ["198.18.0.0/16"],
   "fake_ip_ranges6": ["fdfe:dcba:9876::/64"],
   "fake_ip_probe_domain": "www.example.com",
