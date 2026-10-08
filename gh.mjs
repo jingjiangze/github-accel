@@ -5,7 +5,6 @@
 //   node gh.mjs list                                    打印缓存中的入口状态与评分
 //   node gh.mjs --selftest                              离线自测（闸门 / 脱敏 / 评分 / 冷却，不联网）
 import fs from 'node:fs'
-import os from 'node:os'
 import path from 'node:path'
 import { execFile, spawn } from 'node:child_process'
 import { fileURLToPath } from 'node:url'
@@ -197,15 +196,25 @@ async function bulkSample(prefix) {
   const bytes = m ? Number(m[2]) : 0
   return { code: m ? Number(m[1]) : 0, bytes, bps: bytes > 0 ? Number(m[3]) : 0 }
 }
+// 正文与 curl 的 -w 尾巴拼在同一个 stdout 里，用不会出现在正文里的标记切开。
+// 为什么不留临时文件：某些入口返回的是 HTML 拦截/跳转页，落盘后会被 Defender 判成
+// Trojan:HTML/Redirector 并隔离（实测每小时一条事件 + 一条隔离记录），
+// 而我们只需要在内存里找一下那几个字节的内容标记。
+const TRAILER = '\n__GHW__'
+function splitBody(stdout) {
+  const s = String(stdout || '')
+  const i = s.lastIndexOf(TRAILER)
+  if (i < 0) return { body: '', meta: '' }
+  return { body: s.slice(0, i), meta: s.slice(i + TRAILER.length) }
+}
 async function checkOne(def) {
   const prefix = def.prefix
-  const tmp = path.join(os.tmpdir(), 'ghcanary-' + process.pid + '-' + Math.random().toString(36).slice(2, 8))
   const r = await run('curl.exe', ['-sS', '-L', '--ssl-no-revoke', '--connect-timeout', '4', '--max-time', '12',
-    '-w', '%{http_code} %{time_total} %{size_download}', '-o', tmp, prefix + CFG.proxy_canary], 18000)
-  let body = ''
-  try { body = fs.readFileSync(tmp, 'utf8') } catch (e) {}
-  try { fs.unlinkSync(tmp) } catch (e) {}
-  const m = r.stdout.match(/^(\d+)\s+([\d.]+)\s+(\d+)/)
+    '--max-filesize', String(CFG.canary_max_bytes || 262144),
+    '-w', TRAILER + '%{http_code} %{time_total} %{size_download}', prefix + CFG.proxy_canary], 18000)
+  const sp = splitBody(r.stdout)
+  const body = sp.body
+  const m = sp.meta.match(/^(\d+)\s+([\d.]+)\s+(\d+)/)
   if (!m) return { prefix: def.key, ok: false, soft: false, ms: 1e9, code: 0, bytes: 0, bulk_code: 0, bulk_bytes: 0, bps: 0 }
   const code = Number(m[1]), ms = Math.round(Number(m[2]) * 1000)
   // 必须取回约定内容，免得把自建拦截页/错误页当成"通"
@@ -374,14 +383,13 @@ async function probeRefs(repo) {
   const out = []
   await pool(cands, CFG.proxy_probe_concurrency || 4, async function (e) {
     const u = e.prefix + repo + '/info/refs?service=git-upload-pack'
-    const tmp = path.join(os.tmpdir(), 'ghrefs-' + Math.random().toString(36).slice(2, 8))
+    // 同样不落盘：入口返回 HTML 页时，写出的文件会被 Defender 判成跳转木马
     const r = await run('curl.exe', ['-sS', '--ssl-no-revoke', '--connect-timeout', '4', '--max-time', '10',
-      '-H', 'User-Agent: git/2.50.0', '-o', tmp, '-w', '%{http_code}', u], 14000)
-    let body = ''
-    try { body = fs.readFileSync(tmp, 'latin1').slice(0, 200) } catch (e) {}
-    try { fs.unlinkSync(tmp) } catch (e) {}
+      '--max-filesize', '65536', '-H', 'User-Agent: git/2.50.0', '-w', TRAILER + '%{http_code}', u], 14000)
+    const sp = splitBody(r.stdout)
+    const body = sp.body.slice(0, 200)
     // 必须是 pkt-line（十六进制长度开头），不是 HTML 页
-    const ok = r.stdout === '200' && /^[0-9a-f]{4}# service=git-upload-pack/.test(body)
+    const ok = sp.meta === '200' && /^[0-9a-f]{4}# service=git-upload-pack/.test(body)
     out.push({ entry: e, ok: ok, head: body.slice(0, 24) })
   })
   return out.filter(function (x) { return x.ok }).map(function (x) { return x.entry })
@@ -473,6 +481,11 @@ if (SELFTEST) {
   T('脱敏不含密钥字样', maskPrefix(RELAY_ALIAS).indexOf('<REDACTED>') >= 0, true)
   T('别名标签不泄漏路径', label(RELAY_ALIAS).indexOf('/r/') < 0, true)
   T('普通入口不改写', maskPrefix('https://ghfast.top/'), 'https://ghfast.top/')
+  // 正文与 -w 尾巴的切分（不落盘方案的核心）：标记取最后一个，因为尾巴总在末尾
+  T('切分正文与尾巴', splitBody('hello\n__GHW__200 1.5 5'), { body: 'hello', meta: '200 1.5 5' })
+  T('没有尾巴时返回空', splitBody('just body'), { body: '', meta: '' })
+  T('正文里出现同样标记时取最后一个', splitBody('a__GHW__b\n__GHW__404'), { body: 'a__GHW__b', meta: '404' })
+  T('空输入不炸', splitBody(''), { body: '', meta: '' })
   // 冷却阶梯
   T('两次失败不冷却', cooldownFor(2, 1000), 0)
   T('三次失败进入 30 分钟冷却', cooldownFor(3, 1000) - 1000, 30 * 60e3)
