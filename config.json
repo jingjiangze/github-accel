@@ -8,6 +8,30 @@
     "https://cdn.jsdelivr.net/gh/ittuann/GitHub-IP-hosts@main/hosts",
     "https://raw.githubusercontent.com/ittuann/GitHub-IP-hosts/main/hosts"
   ],
+  "discovery": {
+    "enabled": true,
+    "refresh_h": 6,
+    "proxy": "http://127.0.0.1:7897",
+    "github_meta": { "url": "https://api.github.com/meta", "via": "direct" },
+    "cf_ips4": { "url": "https://www.cloudflare.com/ips-v4", "via": "direct" },
+    "cf_ips6": { "url": "https://www.cloudflare.com/ips-v6", "via": "direct" },
+    "doh": [
+      { "url": "https://cloudflare-dns.com/dns-query?name=DOMAIN&type=TYPE", "via": "proxy", "header": "accept: application/dns-json" },
+      { "url": "https://dns.google/resolve?name=DOMAIN&type=TYPE", "via": "proxy" }
+    ],
+    "sample_per_24": 1,
+    "max_per_domain": 64,
+    "cf_domains": ["cdn.jsdelivr.net", "registry.npmjs.org"],
+    "gh_domains": {
+      "github.com": ["web"],
+      "api.github.com": ["api", "web"],
+      "codeload.github.com": ["git", "web"],
+      "raw.githubusercontent.com": ["pages"],
+      "objects.githubusercontent.com": ["pages"],
+      "avatars.githubusercontent.com": ["pages"],
+      "github.githubassets.com": ["pages"]
+    }
+  },
   "dns_over_proxy": {
     "enabled": true,
     "proxy": "http://127.0.0.1:7897",
@@ -19,9 +43,35 @@
     "win_ratio": 0.85,
     "retries": 3,
     "max_entries": 30,
-    "ok_codes": [200, 206, 301, 302, 404]
+    "ok_codes": [200, 206, 301, 302, 404],
+    "min_bytes": 1
   },
   "proxy_ttl_s": 60,
+  "proxy_probe_concurrency": 4,
+  "proxy_history_samples": 12,
+  "proxy_score_weights": { "stability": 30, "speed_p50": 25, "speed_p10": 15, "latency": 15, "fail_rate": 10, "freshness": 5 },
+  "proxy_cooldown": { "tier1_fails": 3, "tier1_ms": 1800000, "tier2_fails": 5, "tier2_ms": 7200000, "tier3_fails": 8, "tier3_ms": 86400000 },
+  "proxy_freshness_ms": 3600000,
+  "proxy_race_diversity": true,
+  "proxy_explore_every": 6,
+  "pool": {
+    "enabled": true,
+    "probe_per_round": 8,
+    "explore_ratio": 0.15,
+    "min_samples": 2,
+    "max_per_prefix": 2,
+    "history_samples": 16,
+    "active_ok_rate": 0.6,
+    "freshness_ms": 3600000,
+    "speed_every_rounds": 6,
+    "speed_top_n": 4,
+    "speed_min_bytes": 65536,
+    "score_weights": { "available": 35, "lat_p50": 20, "lat_p95": 10, "speed_p50": 20, "speed_p10": 5, "jitter": 5, "freshness": 5 },
+    "cooldown": { "tier1_fails": 3, "tier1_ms": 1800000, "tier2_fails": 5, "tier2_ms": 7200000, "tier3_fails": 8, "tier3_ms": 86400000 }
+  },
+  "fake_ip_ranges4": ["198.18.0.0/16"],
+  "fake_ip_ranges6": ["fdfe:dcba:9876::/64"],
+  "fake_ip_probe_domain": "www.example.com",
   "race": {
     "max": 3,
     "first_byte_ms": 4000,
@@ -44,7 +94,7 @@
     "github.githubassets.com": { "canary": "/", "expect": [200] },
     "avatars.githubusercontent.com": { "canary": "/" },
     "gist.github.com": { "canary": "/", "expect": [200] },
-    "github.com": { "canary": "/", "expect": [200], "strict": true },
+    "github.com": { "canary": "/", "expect": [200], "strict": true, "min_bytes": 8192, "max_ms": 4000 },
     "cdn.jsdelivr.net": { "canary": "/npm/react/package.json" },
     "registry.npmjs.org": { "canary": "/react" }
   },
@@ -62,16 +112,34 @@
     "avatars.githubusercontent.com": ["2606:50c0:8000::154", "2606:50c0:8001::154", "2606:50c0:8002::154", "2606:50c0:8003::154", "2606:50c0:8004::154"],
     "github.githubassets.com": ["2606:50c0:8000::154", "2606:50c0:8001::154", "2606:50c0:8002::154", "2606:50c0:8003::154", "2606:50c0:8004::154"]
   },
+  "proxy_gate": {
+    "enabled": true,
+    "proxy": "http://127.0.0.1:7897",
+    "test_url": "https://github.com/",
+    "timeout_ms": 8000,
+    "handoff_domains": ["github.com", "gist.github.com"]
+  },
   "deny": [],
   "proxies": [
     "https://gh-proxy.com/",
     "https://ghfast.top/",
-    "https://ghproxy.net/",
+    "https://ghproxy.net/"
+  ],
+  "proxies_explore": [
     "https://gitproxy.click/",
     "https://ghgo.net/",
     "https://gh.llkk.cc/",
     "https://github.renfast.net/",
-    "https://gh.aipapi.com/"
+    "https://gh.aipapi.com/",
+    "https://ghproxy.cc/",
+    "https://hub.gitmirror.com/",
+    "https://github.moeyy.xyz/",
+    "https://ghp.ci/",
+    "https://ghps.cc/",
+    "https://gh.api.99988866.xyz/",
+    "https://gh.con.sh/",
+    "https://cdn.gh-proxy.com/",
+    "https://ghproxy.link/"
   ],
   "relay": {
     "enabled": true,
@@ -83,5 +151,7 @@
   "canary_token": "GitHub520 Host Start",
   "bulk_canary": "https://github.com/git-lfs/git-lfs/releases/download/v3.6.1/git-lfs-windows-amd64-v3.6.1.zip",
   "bulk_ms": 6000,
+  "bulk_min_bytes": 262144,
+  "bulk_min_bps": 131072,
   "clone_canary": "https://github.com/octocat/Hello-World.git"
 }

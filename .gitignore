@@ -3,6 +3,8 @@ logs/
 backups/
 report.json
 proxy-state.json
+candidates.json
+pool-state.json
 run.lock
 .selftest/
 *.part
