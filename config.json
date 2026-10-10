@@ -144,7 +144,9 @@
   "manifest": {
     "enabled": true,
     "urls": [
+      "https://raw.githubusercontent.com/jingjiangze/github-accel/manifest-box/proxies.json",
       "https://raw.githubusercontent.com/jingjiangze/github-accel/manifest/proxies.json",
+      "https://cdn.jsdelivr.net/gh/jingjiangze/github-accel@manifest-box/proxies.json",
       "https://cdn.jsdelivr.net/gh/jingjiangze/github-accel@manifest/proxies.json"
     ],
     "ttl_h": 6,

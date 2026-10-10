@@ -12,6 +12,7 @@
 // 单点失败不影响整体：任何一个入口探测抛错都只记进它自己的 err 字段。
 import fs from 'node:fs'
 import path from 'node:path'
+import os from 'node:os'
 import { fileURLToPath } from 'node:url'
 
 const HERE = path.dirname(fileURLToPath(import.meta.url))
@@ -141,6 +142,9 @@ function runnerInfo() {
   const e = process.env
   const repo = e.GITHUB_REPOSITORY || ''
   return {
+    // 观测点名字：本机 gh.mjs 合并多份清单时用它区分"盒子测的"和"runner 测的"
+    vantage: e.ACCEL_VANTAGE || (e.GITHUB_ACTIONS ? 'runner' : 'local'),
+    host: os.hostname(),
     os: e.RUNNER_OS || process.platform,
     arch: e.RUNNER_ARCH || process.arch,
     repository: repo,

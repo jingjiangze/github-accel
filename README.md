@@ -112,6 +112,28 @@ node pool.mjs show github.com     :: 只看某个域
 **为什么不做成「Actions 直接产出 hosts 里的 IP」**：IP 的优劣强依赖线路，境外 runner 测出来的「最快 IP」
 在本线路可能 0 可用（README 开头第 1 条就是这件事的实测）。清单因此只筛**入口**，不发 IP。
 
+### 第二个观测点：盒子（真实线路）
+
+runner 在数据中心，**排名对它没有意义**。真正像用户线路的是那台常开的盒子（山东联通，出口 `222.175.202.106`）：
+
+- `box/run-probe.ps1` 在盒子上常驻：计划任务 `AccelProbe`（开机自启 + 30 分钟看门狗、S4U + `HighestAvailable`、
+  `-WindowStyle Hidden`、`ExecutionTimeLimit=PT0S`，全部无窗口静默），每 6 小时一轮 ——
+  **先从仓库拉最新脚本** → 跑 `manifest.mjs` → 把结果推到 **`manifest-box` 分支**（单提交 force-push，与 CI 同形）。
+- **不在盒子上手抄文件**：脚本从仓库拉，改 `box/run-probe.ps1` 就等于改了盒子上的行为。
+- 推送用一把**只属于本仓库的 write deploy key**（盒子侧 `D:\accel\.ssh\box_deploy`）；拉取是公开读，不需要凭据。
+  要停用：GitHub → Settings → Deploy keys 删掉那一把（盒子上的任务也可以直接 `schtasks /End /TN AccelProbe`）。
+- 盒子侧实测：`raw.githubusercontent.com` **直连 000**（被墙），但 `github.com` / `api.github.com` / 各加速入口都 200 ——
+  所以「体检走加速入口」在盒子上成立，清单本身则从 `manifest-box` 分支读。
+
+本机 `gh.mjs` 把两个观测点的清单取**并集**（盒子在前，见 `config.json` 的 `manifest.urls`；被 `max_entries`
+截断时留下的是盒子的入口）。`doctor` 会把来源打印成 `box-shandong(4) + runner(8)`，一眼看出哪份来自谁。
+
+装/重装盒子任务（一次性，只在重建时用）：
+
+```bat
+ssh wbssh 'powershell -NoProfile -NonInteractive -Command -' < box/install-task.ps1
+```
+
 产物形态（`proxies.json`）：
 
 ```json
