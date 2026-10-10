@@ -1,0 +1,71 @@
+name: pack
+
+# 发行包：每次 push 到 main 打一份「只含运行文件」的 zip（清单在 pack.mjs 的白名单里），
+# 传到滚动 Release `accel-latest`，同时留一份 workflow artifact。
+#
+# 为什么要单独一条工作流：包的内容必须跟着代码走。手工打包迟早和仓库不一致，而且包内容
+# 有断言（pack.mjs --verify 校验「条目 == 白名单」「CRC 与解压往返」），内容漂了会在 CI
+# 红掉，而不是悄悄发出去一个缺件或混进运行期产物的包。
+#
+# 注意：这条工作流只在 main 上触发；manifest / manifest-box 分支的推送不会触发它，
+# Release 生成的 tag 也不匹配 branches: [main]，所以没有自激环路。
+on:
+  push:
+    branches: [main]
+  workflow_dispatch: {}
+
+permissions:
+  contents: write
+
+concurrency:
+  group: pack
+  cancel-in-progress: false
+
+jobs:
+  pack:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      # 先验打包器本身：CRC32 标准向量、ZIP 读写往返、store/deflate 两条路、可复现性
+      - name: 离线自测（含白名单断言）
+        run: node pack.mjs --selftest
+
+      - name: 打包
+        run: node pack.mjs --out dist/accel.zip
+
+      - name: 校验包内容 == 白名单（自研读取器，含 CRC）
+        run: node pack.mjs --verify dist/accel.zip
+
+      # 再用独立实现验一次：自己写的 ZIP 自己读不算数
+      - name: 独立实现复验
+        run: |
+          set -euo pipefail
+          unzip -t dist/accel.zip
+          echo '--- 包内清单 ---'
+          unzip -l dist/accel.zip
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: accel-zip
+          path: dist/accel.zip
+          retention-days: 30
+
+      - name: 发布到滚动 Release accel-latest
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          if ! gh release view accel-latest >/dev/null 2>&1; then
+            gh release create accel-latest \
+              --title 'accel-latest' \
+              --prerelease \
+              --notes '滚动发行包：只含运行文件。由 .github/workflows/pack.yml 自动构建，每次 push 到 main 覆盖；内容清单见 pack.mjs 的白名单。'
+          fi
+          gh release upload accel-latest dist/accel.zip --clobber
+          echo "已发布 https://github.com/${GITHUB_REPOSITORY}/releases/download/accel-latest/accel.zip"
+          echo "本次 commit $(git rev-parse --short HEAD)"

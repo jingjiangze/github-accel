@@ -47,6 +47,31 @@ node accel.mjs --revert
 schtasks /delete /tn QoderAccel /f
 ```
 
+## 发行包（只含运行文件）
+
+不想 clone 的话，下载滚动发行包：
+
+<https://github.com/jingjiangze/github-accel/releases/download/accel-latest/accel.zip>
+
+每次 push 到 `main` 由 `.github/workflows/pack.yml` 自动重建并覆盖（Release `accel-latest`，标 prerelease；同时留一份 workflow artifact）。
+
+包内容 = `pack.mjs` 里的**白名单**，逐个列文件、缺一个就让 CI 红掉。为什么不用黑名单：
+「只含运行文件」用黑名单迟早会漏——这个仓库就漏过 `manifest-cache.json`。
+
+| 进包（16 个） | 不进包 |
+|---|---|
+| `accel.mjs`、`gh.mjs`、`manifest.mjs`、`discover.mjs`、`pool.mjs`、`config.json`、`manifest-seed.json`、`install-task.ps1`、`run-hidden.vbs`、`box/run-probe.ps1`、`box/install-task.ps1`、`relay/`（`wrangler.toml` + `functions/` + `public/`）、`README.md`、`LICENSE` | `.github/`（CI）、`.gitignore`、`relay/test/`（测试），以及所有运行期产物（`logs/`、`backups/`、`report.json`、`proxy-state.json`、`candidates.json`、`pool-state.json`、`manifest-cache.json`、`dist/`、`run.lock`、`relay-key`） |
+
+```bat
+node pack.mjs --selftest                  :: CRC32 标准向量 + ZIP 读写往返 + 白名单断言（不联网）
+node pack.mjs --out dist/accel.zip        :: 本地打一份
+node pack.mjs --verify dist/accel.zip     :: 校验「包内条目 == 白名单」（含 CRC 与解压往返）
+```
+
+时间戳固定成 1980-01-01，所以**同样内容打出同样字节**：`sha256` 稳定，「包变了」只可能因为文件变了。
+`pack.mjs` 是零依赖的（压缩用内置 `zlib`，CRC32 自己实现——Node 20 还没有 `zlib.crc32`，而 CI 用 Node 20）；
+CI 里除了自研读取器，还会用 `unzip -t` 这个独立实现再复验一遍。
+
 ## 为什么不做成"直接改 hosts 就完事"的加速器
 
 这些是本仓库所有判定的来源，都是**同一台机器同一时段**的实测数字，不是转述：
