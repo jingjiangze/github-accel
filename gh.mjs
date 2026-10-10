@@ -130,26 +130,54 @@ function manifestEntries(mf) {
   if (m.only_ok !== false) list = list.filter(function (e) { return e && e.ok })
   return list.map(function (e) { return e && e.url }).filter(function (u) { return typeof u === 'string' }).slice(0, max)
 }
-// 依次尝试 config 里的来源（raw → jsDelivr），任一成功就写本地缓存。
+// 纯函数：把多个观测点的清单并成一个候选列表。顺序即优先级——config 里盒子在前，
+// 所以并集被 max_entries 截断时留下的是盒子的入口（真实线路比中立出口更相关）。
+function mergeManifests(list) {
+  const out = [], seen = new Set(), sources = []
+  for (const s of (list || [])) {
+    const mf = s && s.mf
+    if (!mf || !Array.isArray(mf.entries)) { sources.push({ url: s && s.url, ok: false }); continue }
+    const picked = manifestEntries(mf)
+    for (const u of picked) if (!seen.has(u)) { seen.add(u); out.push(u) }
+    sources.push({
+      url: s.url, ok: true, count: picked.length,
+      vantage: (mf.runner && (mf.runner.vantage || mf.runner.os)) || '',
+      generated_at: mf.generated_at || ''
+    })
+  }
+  return { urls: out, sources: sources }
+}
+function sourceLabel(sources) {
+  if (!sources || !sources.length) return ''
+  return sources.map(function (s) {
+    return s.ok ? ((s.vantage || hostOf(s.url)) + '(' + (s.count || 0) + ')') : (hostOf(s.url) + '(×)')
+  }).join(' + ')
+}
+// 依次取 config 里的来源（盒子 → runner，各带 raw/jsDelivr 镜像），并成一个候选池后写本地缓存。
 // 全部失败时退回上一份缓存（哪怕过期）——宁可候选陈旧，也不要在 GitHub 不通时把候选池清空。
 async function loadManifest(force) {
   const m = CFG.manifest || {}
-  if (!m.enabled) return { urls: [], at: 0, stale: false, source: 'disabled' }
+  if (!m.enabled) return { urls: [], at: 0, stale: false, source: 'disabled', sources: [] }
   const ttl = (m.ttl_h || 6) * 3600e3
   const cache = readManifestCache()
-  if (!force && cache && cache.at && Date.now() - cache.at < ttl) return { urls: manifestEntries(cache), at: cache.at, stale: false, source: cache.source || 'cache' }
+  if (!force && cache && cache.at && Date.now() - cache.at < ttl) {
+    return { urls: manifestEntries(cache), at: cache.at, stale: false, source: sourceLabel(cache.sources), generated_at: cache.generated_at || '', sources: cache.sources || [] }
+  }
+  const fetched = []
   for (const url of manifestUrls()) {
     const r = await run('curl.exe', ['-sS', '-L', '--ssl-no-revoke', '--connect-timeout', '4', '--max-time', '12', url], 16000)
-    if (r.code !== 0 || !r.stdout) continue
-    let mf
-    try { mf = JSON.parse(r.stdout) } catch (e) { continue }
-    if (!mf || !Array.isArray(mf.entries)) continue
-    const rec = Object.assign({}, mf, { at: Date.now(), source: url })
-    try { fs.writeFileSync(MANIFEST_CACHE, JSON.stringify(rec, null, 1)) } catch (e) {}
-    return { urls: manifestEntries(mf), at: rec.at, stale: false, source: url, generated_at: mf.generated_at || '' }
+    let mf = null
+    if (r.code === 0 && r.stdout) { try { mf = JSON.parse(r.stdout) } catch (e) { mf = null } }
+    fetched.push({ url: url, mf: mf })
   }
-  if (cache) return { urls: manifestEntries(cache), at: cache.at || 0, stale: true, source: (cache.source || 'cache') + '（取新失败，用缓存）' }
-  return { urls: [], at: 0, stale: true, source: '' }
+  const merged = mergeManifests(fetched)
+  if (merged.urls.length) {
+    const rec = { at: Date.now(), generated_at: merged.sources.reduce(function (a, s) { return s.generated_at && s.generated_at > a ? s.generated_at : a }, ''), sources: merged.sources, entries: merged.urls.map(function (u) { return { url: u, ok: true } }) }
+    try { fs.writeFileSync(MANIFEST_CACHE, JSON.stringify(rec, null, 1)) } catch (e) {}
+    return { urls: merged.urls, at: rec.at, stale: false, source: sourceLabel(merged.sources), generated_at: rec.generated_at, sources: merged.sources }
+  }
+  if (cache) return { urls: manifestEntries(cache), at: cache.at || 0, stale: true, source: sourceLabel(cache.sources) + '（取新失败，用缓存）', generated_at: cache.generated_at || '', sources: cache.sources || [] }
+  return { urls: [], at: 0, stale: true, source: sourceLabel(merged.sources), sources: merged.sources }
 }
 // 候选池每 N 轮探一次（默认 6 轮 ≈ 1 小时，按 10 分钟一轮算）
 function exploreDue(st) {
@@ -613,6 +641,17 @@ if (SELFTEST) {
   ] }
   const pm = pickRacers(stm, 3)
   T('清单入口不参与竞速', pm.length === 1 && pm[0].prefix === 'https://core2/', true)
+  // 多观测点合并：盒子（真实线路）在前，与 runner 的并集去重
+  const mm = mergeManifests([
+    { url: 'https://raw/manifest-box/proxies.json', mf: { generated_at: '2026-10-10T12:00:00Z', runner: { vantage: 'box-shandong' }, entries: [{ url: 'https://a/', ok: true }] } },
+    { url: 'https://raw/manifest/proxies.json', mf: { generated_at: '2026-10-10T11:00:00Z', runner: { vantage: 'runner' }, entries: [{ url: 'https://a/', ok: true }, { url: 'https://b/', ok: true }, { url: 'https://dead/', ok: false }] } }
+  ])
+  T('合并去重且盒子在前', mm.urls, ['https://a/', 'https://b/'])
+  T('合并保留各观测点计数', mm.sources.map(function (s) { return s.vantage + ':' + s.count }), ['box-shandong:1', 'runner:2'])
+  T('合并标签', sourceLabel(mm.sources), 'box-shandong(1) + runner(2)')
+  const mm2 = mergeManifests([{ url: 'https://x/', mf: null }, { url: 'https://y/', mf: { entries: [{ url: 'https://c/', ok: true }], runner: { vantage: 'box' } } }])
+  T('坏来源不致命', [mm2.urls, mm2.sources[0].ok], [['https://c/'], false])
+  T('全坏来源给空列表', mergeManifests([{ url: 'https://x/', mf: null }]).urls, [])
   console.log(bad ? '  自测失败 ' + bad + ' 项' : '  自测全部通过')
   process.exit(bad ? 1 : 0)
 }
