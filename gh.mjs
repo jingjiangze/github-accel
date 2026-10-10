@@ -96,13 +96,60 @@ function relayReal() {
 function isRelay(p) { return p === RELAY_ALIAS || (!!RELAY_REAL && p === RELAY_REAL) }
 function maskPrefix(p) { return isRelay(p) ? String(CFG.relay.base).replace('KEY', '<REDACTED>') : p }
 function label(p) { return isRelay(p) ? 'relay:' + hostOf(CFG.relay.base) : hostOf(p) }
-function entryDefs(includeExplore) {
+function tierTag(t) { return t === 'manifest' ? '[清]' : t === 'explore' ? '[候]' : '[主]' }
+function entryDefs(includeExplore, manifestU) {
   const list = (CFG.proxies || []).map(function (p) { return { key: p, prefix: p, tier: 'core' } })
   const rp = relayReal()
   if (rp) list.unshift({ key: RELAY_ALIAS, prefix: rp, tier: 'core' })
   // 候选池只做低频测量，不参与竞速：它的样本可能是一小时前的，拿它选路等于用陈旧数据
-  if (includeExplore) for (const p of (CFG.proxies_explore || [])) list.push({ key: p, prefix: p, tier: 'explore' })
+  if (includeExplore) {
+    const seen = new Set(list.map(function (e) { return e.key }))
+    for (const p of (CFG.proxies_explore || [])) if (!seen.has(p)) { seen.add(p); list.push({ key: p, prefix: p, tier: 'explore' }) }
+    // 动态清单（Actions 在中立出口判过"还活着"的入口）：并进候选池，本机再实测一遍。
+    // 同样只做候选、不参与竞速，也不改主清单——改 config 的 proxies 属于用户的决定。
+    for (const p of (manifestU || [])) if (!seen.has(p)) { seen.add(p); list.push({ key: p, prefix: p, tier: 'manifest' }) }
+  }
   return list
+}
+
+// ---------- 动态清单：Actions 体检出的 live 入口，本机当候选池消费 ----------
+// 判定只有"存在性"（返回约定内容 + 能拉够数据），跟线路无关；排名仍由本机实测决定。
+const MANIFEST_CACHE = path.join(HERE, (CFG.manifest && CFG.manifest.cache) || 'manifest-cache.json')
+function readManifestCache() {
+  try { return JSON.parse(fs.readFileSync(MANIFEST_CACHE, 'utf8')) } catch (e) { return null }
+}
+function manifestUrls() {
+  const m = CFG.manifest || {}
+  return [].concat(m.urls || []).filter(function (u) { return typeof u === 'string' && /^https?:\/\//.test(u) })
+}
+// 清单里可用的入口 URL（默认只取 ok=true 的；max_entries 防止清单无限膨胀把每轮体检拖长）
+function manifestEntries(mf) {
+  const m = CFG.manifest || {}
+  const max = m.max_entries || 24
+  let list = (mf && Array.isArray(mf.entries)) ? mf.entries : (mf && Array.isArray(mf.live)) ? mf.live.map(function (u) { return { url: u, ok: true } }) : []
+  if (m.only_ok !== false) list = list.filter(function (e) { return e && e.ok })
+  return list.map(function (e) { return e && e.url }).filter(function (u) { return typeof u === 'string' }).slice(0, max)
+}
+// 依次尝试 config 里的来源（raw → jsDelivr），任一成功就写本地缓存。
+// 全部失败时退回上一份缓存（哪怕过期）——宁可候选陈旧，也不要在 GitHub 不通时把候选池清空。
+async function loadManifest(force) {
+  const m = CFG.manifest || {}
+  if (!m.enabled) return { urls: [], at: 0, stale: false, source: 'disabled' }
+  const ttl = (m.ttl_h || 6) * 3600e3
+  const cache = readManifestCache()
+  if (!force && cache && cache.at && Date.now() - cache.at < ttl) return { urls: manifestEntries(cache), at: cache.at, stale: false, source: cache.source || 'cache' }
+  for (const url of manifestUrls()) {
+    const r = await run('curl.exe', ['-sS', '-L', '--ssl-no-revoke', '--connect-timeout', '4', '--max-time', '12', url], 16000)
+    if (r.code !== 0 || !r.stdout) continue
+    let mf
+    try { mf = JSON.parse(r.stdout) } catch (e) { continue }
+    if (!mf || !Array.isArray(mf.entries)) continue
+    const rec = Object.assign({}, mf, { at: Date.now(), source: url })
+    try { fs.writeFileSync(MANIFEST_CACHE, JSON.stringify(rec, null, 1)) } catch (e) {}
+    return { urls: manifestEntries(mf), at: rec.at, stale: false, source: url, generated_at: mf.generated_at || '' }
+  }
+  if (cache) return { urls: manifestEntries(cache), at: cache.at || 0, stale: true, source: (cache.source || 'cache') + '（取新失败，用缓存）' }
+  return { urls: [], at: 0, stale: true, source: '' }
 }
 // 候选池每 N 轮探一次（默认 6 轮 ≈ 1 小时，按 10 分钟一轮算）
 function exploreDue(st) {
@@ -236,7 +283,11 @@ async function checkAll(force, withExplore) {
   const now = Date.now()
   const round = ((st && st.round) || 0) + 1
   const wantExplore = !!withExplore || exploreDue(st)
-  const entries = await pool(entryDefs(wantExplore), CFG.proxy_probe_concurrency || 4, async function (d) {
+  // 清单只在探候选池那轮去取（默认约一小时一次），避免每 10 分钟都去拉一次远端
+  const mf = wantExplore
+    ? await loadManifest(false)
+    : { urls: [], at: (st && st.manifest && st.manifest.at) || 0, stale: false, source: (st && st.manifest && st.manifest.source) || '', generated_at: (st && st.manifest && st.manifest.generated_at) || '' }
+  const entries = await pool(entryDefs(wantExplore, mf.urls), CFG.proxy_probe_concurrency || 4, async function (d) {
     const r = await checkOne(d)
     r.tier = d.tier
     r.hist = mergeHist(prevByKey.get(d.key), r, now)
@@ -244,7 +295,11 @@ async function checkAll(force, withExplore) {
   })
   // 评分是整组相对量（按当前候选集归一化），所以在这里算完一起落盘，
   // 免得下游（accel 的 report.json、list）只能看到 undefined
-  const out = { v: 2, at: now, round: round, explore: wantExplore, target: CFG.proxy_canary, entries: scoreAll(entries, now) }
+  const out = {
+    v: 2, at: now, round: round, explore: wantExplore, target: CFG.proxy_canary,
+    manifest: { at: mf.at || 0, stale: !!mf.stale, source: mf.source || '', count: (mf.urls || []).length, generated_at: mf.generated_at || '' },
+    entries: scoreAll(entries, now)
+  }
   fs.writeFileSync(STATE, JSON.stringify(out, null, 1))
   return out
 }
@@ -264,7 +319,8 @@ function order(st) {
 // strict=true 只认过了带宽门槛的；带宽门槛全灭时退化为"仅内容标记可用"，别让竞速直接无入口
 function pickRacers(st, n, strict) {
   const now = Date.now()
-  const ok = order(st).filter(function (e) { return (strict === false ? (e.ok || e.soft) : e.ok) && e.tier !== 'explore' })
+  // 只有主清单（core）能进竞速：候选池（explore）与动态清单（manifest）都只做低频测量
+  const ok = order(st).filter(function (e) { return (strict === false ? (e.ok || e.soft) : e.ok) && (e.tier || 'core') === 'core' })
   const usable = ok.filter(function (e) { return !inCooldown(e, now) })
   const base = usable.length ? usable : ok
   if (!CFG.proxy_race_diversity) return base.slice(0, n)
@@ -435,15 +491,19 @@ async function doctor(show, explore) {
   const now = Date.now()
   console.log('入口体检 @ ' + new Date(st.at).toLocaleString() + '  第 ' + st.round + ' 轮' + (st.explore ? '（含候选池）' : '') +
     '  目标 ' + st.target + (show ? '' : '  (缓存 ' + (CFG.proxy_ttl_s || 60) + 's)'))
-  for (const e of order(st)) console.log('  ' + (e.ok ? 'OK  ' : (e.soft ? 'SOFT' : 'DEAD')) + ' ' + (e.tier === 'explore' ? '[候]' : '[主]') + ' ' +
+  if (st.manifest && (st.manifest.count || st.manifest.at)) {
+    console.log('  动态清单：' + st.manifest.count + ' 个候选' + (st.manifest.generated_at ? '，生成于 ' + st.manifest.generated_at : '') +
+      (st.manifest.stale ? '（取新失败，用的是缓存）' : '') + (st.manifest.source ? '  ← ' + st.manifest.source : ''))
+  }
+  for (const e of order(st)) console.log('  ' + (e.ok ? 'OK  ' : (e.soft ? 'SOFT' : 'DEAD')) + ' ' + tierTag(e.tier) + ' ' +
     maskPrefix(e.prefix).padEnd(46) +
     (e.ms === 1e9 ? '     -' : (String(e.ms) + 'ms').padStart(7)) +
     '  实测 ' + mbps(e.bps || 0).padStart(6) + ' MB/s  评分 ' + String(e.score || 0).padStart(5) +
     ' code=' + e.code + '/' + e.bulk_code + ' 样本=' + (e.bulk_bytes || 0) +
     (inCooldown(e, now) ? '  [冷却中]' : ''))
-  // 候选池里翻身的入口不会自动进主清单（改 config 属于用户的决定），这里点名提示
+  // 候选池（含动态清单）里翻身的入口不会自动进主清单（改 config 属于用户的决定），这里点名提示
   if (st.explore) {
-    const promoted = order(st).filter(function (e) { return e.tier === 'explore' && e.ok })
+    const promoted = order(st).filter(function (e) { return (e.tier === 'explore' || e.tier === 'manifest') && e.ok })
     console.log(promoted.length
       ? '  候选池本轮可用：' + promoted.map(function (e) { return maskPrefix(e.prefix) + '（' + mbps(e.bps || 0) + ' MB/s）' }).join('、') +
         '  —— 想启用请加进 config.json 的 proxies'
@@ -453,7 +513,7 @@ async function doctor(show, explore) {
 function list() {
   try {
     const now = Date.now()
-    for (const e of order(loadState())) console.log((e.ok ? 'OK   ' : (e.soft ? 'SOFT ' : 'DEAD ')) + (e.tier === 'explore' ? '[候]' : '[主]') + ' ' +
+    for (const e of order(loadState())) console.log((e.ok ? 'OK   ' : (e.soft ? 'SOFT ' : 'DEAD ')) + tierTag(e.tier) + ' ' +
       maskPrefix(e.prefix).padEnd(46) + '  ' + mbps(e.bps || 0) + ' MB/s  评分 ' + (e.score || 0) + (inCooldown(e, now) ? '  [冷却中]' : ''))
   } catch (e) { console.log('无体检记录，先跑 node gh.mjs doctor') }
 }
@@ -539,6 +599,20 @@ if (SELFTEST) {
   T('首轮探候选池', exploreDue(null), true)
   T('第 1 轮不探候选池', exploreDue({ round: 1 }), false)
   T('第 6 轮探候选池', exploreDue({ round: 6 }), true)
+  // 动态清单：并进候选池（tier=manifest）、与主清单去重、同样不参与竞速
+  T('清单入口标成 manifest 层', entryDefs(true, ['https://mf.test/']).filter(function (e) { return e.prefix === 'https://mf.test/' })[0].tier, 'manifest')
+  T('清单与主清单去重', entryDefs(true, ['https://gh-proxy.com/']).filter(function (e) { return e.prefix === 'https://gh-proxy.com/' }).length, 1)
+  T('不探候选池时不带清单入口', entryDefs(false, ['https://mf.test/']).some(function (e) { return e.tier === 'manifest' }), false)
+  T('清单默认只取 ok 的', manifestEntries({ entries: [{ url: 'https://a/', ok: true }, { url: 'https://b/', ok: false }] }), ['https://a/'])
+  T('清单兼容只有 live 数组', manifestEntries({ live: ['https://c/'] }), ['https://c/'])
+  T('清单数量有上限', manifestEntries({ entries: Array.from({ length: 100 }, function (_, i) { return { url: 'https://x' + i + '/', ok: true } }) }).length, (CFG.manifest && CFG.manifest.max_entries) || 24)
+  T('清单标签', tierTag('manifest'), '[清]')
+  const stm = { entries: [
+    { prefix: 'https://core2/', ok: true, bps: 100, ms: 10, tier: 'core', hist: { samples: 3, ok_count: 3, fail_streak: 0, speeds: [100], lats: [10] } },
+    { prefix: 'https://mf2/', ok: true, bps: 9999, ms: 5, tier: 'manifest', hist: { samples: 3, ok_count: 3, fail_streak: 0, speeds: [9999], lats: [5] } }
+  ] }
+  const pm = pickRacers(stm, 3)
+  T('清单入口不参与竞速', pm.length === 1 && pm[0].prefix === 'https://core2/', true)
   console.log(bad ? '  自测失败 ' + bad + ' 项' : '  自测全部通过')
   process.exit(bad ? 1 : 0)
 }

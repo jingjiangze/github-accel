@@ -1,0 +1,75 @@
+name: proxy-manifest
+
+# 反代入口「动态清单」：定期从中立出口体检候选入口，把结果发布到 `manifest` 分支的 proxies.json。
+# 本机 gh.mjs 读 config.json 的 manifest 段，把 live 入口并进候选池（见 README）。
+#
+# 为什么发布到分支而不是 Pages / R2：
+#   - 这个仓库除 GITHUB_TOKEN 外没有别的 secret，也不想引第三方托管；
+#   - `manifest` 分支用 raw.githubusercontent.com / jsDelivr 就能取到，本机依次尝试；
+#   - 单提交 + force-push，不留历史（每轮覆盖，天然是"滚动更新"）。
+#
+# 关于节拍（重要）：GitHub 的 schedule 在本账号上是饥饿的（实测 */10 五小时只命中一次），
+# 所以 cron 只当兜底，真正的触发是 push 与手动 dispatch。需要外部节拍时，
+# 用带 workflow 权限的 token 打 repository_dispatch（type=manifest）——不依赖 GitHub 的 cron。
+on:
+  schedule:
+    - cron: '17 */6 * * *'
+  workflow_dispatch: {}
+  repository_dispatch:
+    types: [manifest]
+  push:
+    branches: [main]
+    paths:
+      - 'manifest.mjs'
+      - 'manifest-seed.json'
+      - 'config.json'
+      - '.github/workflows/proxy-manifest.yml'
+
+permissions:
+  contents: write
+
+concurrency:
+  group: proxy-manifest
+  cancel-in-progress: false
+
+jobs:
+  manifest:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      # 先跑离线自测：判定逻辑坏了的话，宁可红在这里，也不要发布一份错的清单
+      - name: 离线自测（不联网）
+        run: node manifest.mjs --selftest
+
+      - name: 体检候选入口（内容级 + 带宽）
+        run: node manifest.mjs --out dist/proxies.json
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: proxies-manifest
+          path: dist/proxies.json
+          if-no-files-found: ignore
+          retention-days: 14
+
+      # 一个入口都不活时上一步会失败，这里也就不会执行——保留上一份可用清单，不留半截产物
+      - name: 发布到 manifest 分支
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          test -s dist/proxies.json || { echo "::error::dist/proxies.json 缺失或为空"; exit 1; }
+          cd dist
+          git init -q
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git checkout -q -b manifest
+          git add proxies.json
+          git commit -q -m "manifest: $(date -u +%FT%TZ)"
+          git push -q -f "https://x-access-token:${GITHUB_TOKEN}@github.com/${GITHUB_REPOSITORY}.git" manifest
+          echo "已发布：https://raw.githubusercontent.com/${GITHUB_REPOSITORY}/manifest/proxies.json"

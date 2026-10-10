@@ -141,6 +141,17 @@
     "https://cdn.gh-proxy.com/",
     "https://ghproxy.link/"
   ],
+  "manifest": {
+    "enabled": true,
+    "urls": [
+      "https://raw.githubusercontent.com/jingjiangze/github-accel/manifest/proxies.json",
+      "https://cdn.jsdelivr.net/gh/jingjiangze/github-accel@manifest/proxies.json"
+    ],
+    "ttl_h": 6,
+    "cache": "manifest-cache.json",
+    "max_entries": 24,
+    "only_ok": true
+  },
   "relay": {
     "enabled": true,
     "base": "https://gh-accel-relay.pages.dev/r/KEY/",
@@ -153,5 +164,7 @@
   "bulk_ms": 6000,
   "bulk_min_bytes": 262144,
   "bulk_min_bps": 131072,
+  "bulk_max_bytes": 4194304,
+  "manifest_probe_ms": 12000,
   "clone_canary": "https://github.com/octocat/Hello-World.git"
 }

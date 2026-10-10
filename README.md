@@ -39,6 +39,7 @@ node accel.mjs --selftest
 node gh.mjs --selftest
 node pool.mjs --selftest
 node discover.mjs --selftest
+node manifest.mjs --selftest
 node relay/test/middleware.test.mjs
 
 :: 回滚
@@ -91,6 +92,56 @@ node pool.mjs show github.com     :: 只看某个域
 
 `--dry` 不触发发现、也不写池子（严格只读）。
 
+## 反代入口的动态清单（`manifest.mjs` + GitHub Actions）
+
+`config.json` 的 `proxies` 是手挑的主清单，会随时间烂掉（入口挂掉、或变成返回 200 的拦截页），
+而**只有本机实测才知道哪条线路快**。清单只解决另一件事——「这个入口本身还活着吗」——它跟线路无关，
+所以可以放到中立出口去做：
+
+- `.github/workflows/proxy-manifest.yml` 定期（默认 6 小时）在 GitHub Actions 上跑 `node manifest.mjs`，
+  对 `manifest-seed.json`（人工维护的「待测集合」）∪ `config.json` 的 `proxies` / `proxies_explore` 逐个做
+  **内容级体检**（必须取回约定 canary 内容）+ **带宽样本**（真拉够一段数据），结果写成 `proxies.json`，
+  发布到 `manifest` 分支（单提交 + force-push，天然滚动更新，不留历史）。
+- 本机 `gh.mjs` 按 `config.json` 的 `manifest` 段取这份清单（先 raw、再 jsDelivr，全失败退回本地缓存），
+  把 `ok=true` 的入口并进候选池、标成 `[清]`，**和候选池一样只做低频测量、不参与竞速**——
+  runner 的速度数字对本机线路没有参考价值，排名仍由本机实测决定（见「为什么是竞速而不是选最快的入口」）。
+
+判定与 `gh.mjs doctor` 同源：`ok` = 取回约定内容 **且** 大文件样本过了 `bulk_min_bytes` / `bulk_min_bps`。
+只回 200 没有约定内容的拦截页、或只回几百字节错误页的，都进不了 `live`。
+
+**为什么不做成「Actions 直接产出 hosts 里的 IP」**：IP 的优劣强依赖线路，境外 runner 测出来的「最快 IP」
+在本线路可能 0 可用（README 开头第 1 条就是这件事的实测）。清单因此只筛**入口**，不发 IP。
+
+产物形态（`proxies.json`）：
+
+```json
+{
+  "schema": 1,
+  "generated_at": "2026-10-10T11:26:28.020Z",
+  "runner": { "os": "Linux", "run_url": "https://github.com/.../actions/runs/..." },
+  "canary": { "url": "https://raw.githubusercontent.com/521xueweihan/GitHub520/main/hosts", "token": "GitHub520 Host Start", "bulk_url": "..." },
+  "thresholds": { "bulk_min_bytes": 262144, "bulk_min_bps": 131072 },
+  "counts": { "probed": 40, "ok": 4, "soft": 2, "dead": 34 },
+  "live": ["https://gh-proxy.com/", "https://ghfast.top/", "..."],
+  "entries": [{ "url": "https://gh-proxy.com/", "ok": true, "soft": true, "content": true, "range": true, "code": 200, "ms": 727, "bulk_bytes": 4208487, "bps": 1849072 }]
+}
+```
+
+```bat
+node manifest.mjs --selftest                  :: 离线自测（打桩 fetch，不联网）
+node manifest.mjs --out dist/proxies.json     :: 在本机跑一遍（走的是本线路，仅用于自检）
+node gh.mjs doctor --force --explore          :: 看清单入口的本机实测（标 [清]）
+```
+
+**节拍（重要）**：GitHub 的 `schedule` 在本账号上是饥饿的（实测 `*/10` 五小时只命中一次），
+所以 cron 只当兜底；真正的触发是 push 与手动 `workflow_dispatch`。需要外部节拍时，用带 workflow 权限的
+token 打 `repository_dispatch`（`type=manifest`），不要指望 GitHub 的 cron。
+
+`config.json` 的 `manifest` 段：`enabled` 开关；`urls` 清单地址（依次尝试）；`ttl_h` 本地缓存有效期
+（默认 6 小时）；`cache` 本地缓存文件名（已 gitignore）；`max_entries` 最多并进几个（默认 24，防止清单
+膨胀把每轮体检拖长）；`only_ok` 只取 `ok=true` 的（默认 true）。另有 `manifest_probe_ms`（单次探测上限）
+与 `bulk_max_bytes`（带宽样本最多拉多少）供这一层使用。清单只加候选，**改主清单 `proxies` 仍由用户决定**。
+
 ## 用法与配置
 
 `config.json` 的关键项：
@@ -107,6 +158,7 @@ node pool.mjs show github.com     :: 只看某个域
 - `deny`：永不固定的域名。
 - `proxies`：主入口清单，每轮体检都会测。`gh.mjs doctor --force` 重新体检。
 - `proxies_explore`：候选池，只做**低频测量、不参与竞速**（它的样本可能是一小时前的，拿它选路等于用陈旧数据）。`proxy_explore_every` 控制节奏（默认 6 轮 ≈ 1 小时）；`doctor --explore` 可强制探一次，测出可用的会点名提示你加进 `proxies`。
+- `manifest`：反代入口的**动态清单**（Actions 在中立出口体检出的 live 入口，本机当候选池消费，标 `[清]`）。见下文专节。
 - `proxy_ttl_s`：入口体检缓存（默认 60 秒）。
 - `proxy_probe_concurrency`：入口体检并发数（默认 4）。
 - `proxy_history_samples`：每个入口保留多少轮历史样本，用于算稳定性/分位数。

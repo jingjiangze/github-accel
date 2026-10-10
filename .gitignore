@@ -5,9 +5,13 @@ report.json
 proxy-state.json
 candidates.json
 pool-state.json
+manifest-cache.json
 run.lock
 .selftest/
 *.part
+
+# 动态清单的生成产物（由 Actions 发到 manifest 分支，不进 main）
+dist/
 
 # 密钥绝不入库（仓库是公开的）
 relay-key
