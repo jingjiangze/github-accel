@@ -149,7 +149,14 @@ function mergeManifests(list) {
 }
 function sourceLabel(sources) {
   if (!sources || !sources.length) return ''
-  return sources.map(function (s) {
+  // 同一观测点被多个镜像取到（raw + jsDelivr）只报一次；失败项按主机去重。
+  const byV = new Map()
+  for (const s of sources) {
+    const k = s.ok ? 'v:' + (s.vantage || hostOf(s.url)) : 'f:' + hostOf(s.url)
+    const prev = byV.get(k)
+    if (!prev || (s.ok && (s.count || 0) > (prev.count || 0))) byV.set(k, s)
+  }
+  return [...byV.values()].map(function (s) {
     return s.ok ? ((s.vantage || hostOf(s.url)) + '(' + (s.count || 0) + ')') : (hostOf(s.url) + '(×)')
   }).join(' + ')
 }
@@ -649,6 +656,12 @@ if (SELFTEST) {
   T('合并去重且盒子在前', mm.urls, ['https://a/', 'https://b/'])
   T('合并保留各观测点计数', mm.sources.map(function (s) { return s.vantage + ':' + s.count }), ['box-shandong:1', 'runner:2'])
   T('合并标签', sourceLabel(mm.sources), 'box-shandong(1) + runner(2)')
+  T('同观测点去重', sourceLabel([
+    { url: 'https://rawx.test/mb', ok: false },
+    { url: 'https://rawx.test/m', ok: true, count: 8, vantage: 'runner' },
+    { url: 'https://jdx.test/mb', ok: true, count: 5, vantage: 'box-shandong' },
+    { url: 'https://jdx.test/m', ok: true, count: 8, vantage: 'runner' }
+  ]), 'rawx.test(×) + runner(8) + box-shandong(5)')
   const mm2 = mergeManifests([{ url: 'https://x/', mf: null }, { url: 'https://y/', mf: { entries: [{ url: 'https://c/', ok: true }], runner: { vantage: 'box' } } }])
   T('坏来源不致命', [mm2.urls, mm2.sources[0].ok], [['https://c/'], false])
   T('全坏来源给空列表', mergeManifests([{ url: 'https://x/', mf: null }]).urls, [])
