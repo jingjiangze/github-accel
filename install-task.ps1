@@ -1,15 +1,25 @@
-# Installs / refreshes the windowless 10-minute accel pass as a scheduled task.
+# Installs / refreshes the windowless adaptive hosts pass as a scheduled task.
+#
+# -IntervalMinutes overrides config.interval_minutes (default 10) for a lighter
+# footprint; 1440 = one pass per day. One pass keeps BOTH artifacts current:
+# accel.mjs re-pins hosts and then runs `gh.mjs doctor --force`, which pulls the
+# freshest proxy manifest (manifest / manifest-box) into the local cache.
+# -TaskName overrides config.task_name when you want a distinct task.
 #
 # Writing the hosts file normally needs administrator rights. This machine works
 # today only because the hosts FILE carries an explicit write grant
 # (icacls shows "Everyone:(F)"); the containing directory is still not writable.
 # A task that "runs fine" but cannot write hosts would silently never accelerate
 # anything, so this script preflights writability instead of assuming it.
+param(
+  [int]$IntervalMinutes = 0,
+  [string]$TaskName = ''
+)
 $ErrorActionPreference = 'Stop'
 $dir = Split-Path -Parent $MyInvocation.MyCommand.Path
 $cfg = Get-Content (Join-Path $dir 'config.json') -Raw -Encoding UTF8 | ConvertFrom-Json
-$min = [int]$cfg.interval_minutes
-$name = [string]$cfg.task_name
+$min = if ($IntervalMinutes -gt 0) { $IntervalMinutes } else { [int]$cfg.interval_minutes }
+$name = if ($TaskName) { $TaskName } else { [string]$cfg.task_name }
 $hostsPath = [string]$cfg.hosts_path
 
 $isAdmin = ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
