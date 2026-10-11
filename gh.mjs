@@ -318,11 +318,12 @@ async function checkAll(force, withExplore) {
   const now = Date.now()
   const round = ((st && st.round) || 0) + 1
   const wantExplore = !!withExplore || exploreDue(st)
-  // 清单只在探候选池那轮去取（默认约一小时一次），避免每 10 分钟都去拉一次远端
-  const mf = wantExplore
-    ? await loadManifest(false)
-    : { urls: [], at: (st && st.manifest && st.manifest.at) || 0, stale: false, source: (st && st.manifest && st.manifest.source) || '', generated_at: (st && st.manifest && st.manifest.generated_at) || '' }
-  const entries = await pool(entryDefs(wantExplore, mf.urls), CFG.proxy_probe_concurrency || 4, async function (d) {
+  // 清单每轮都做 TTL 检查：缓存未过期（默认 6h）时 loadManifest 直接返回缓存、零网络开销；
+  // 过期才发起请求。无论是否 explore 轮，只要清单已知（本机取到过）就把它并入体检——
+  // 否则低频节拍（如每天一轮）下清单会长期不刷新，且显示会挂着上一轮的来源数字而 count=0 自相矛盾。
+  const mf = await loadManifest(false)
+  const manifestUrls = (mf.urls && mf.urls.length) ? mf.urls : []
+  const entries = await pool(entryDefs(wantExplore, manifestUrls), CFG.proxy_probe_concurrency || 4, async function (d) {
     const r = await checkOne(d)
     r.tier = d.tier
     r.hist = mergeHist(prevByKey.get(d.key), r, now)
