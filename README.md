@@ -143,7 +143,8 @@ runner 在数据中心，**排名对它没有意义**。真正像用户线路的
 
 - `box/run-probe.ps1` 在盒子上常驻：计划任务 `AccelProbe`（开机自启 + 30 分钟看门狗、S4U + `HighestAvailable`、
   `-WindowStyle Hidden`、`ExecutionTimeLimit=PT0S`，全部无窗口静默），每 6 小时一轮 ——
-  **先从仓库拉最新脚本** → 跑 `manifest.mjs` → 把结果推到 **`manifest-box` 分支**（单提交 force-push，与 CI 同形）。
+  **先从仓库拉最新脚本** → 跑 `manifest.mjs` → 把结果推到 **`manifest-box` 分支**（单提交 force-push，与 CI 同形） →
+  **再跑 `node accel.mjs` 把本机这条线路的最优 hosts 钉进盒子自己的 hosts**（见下「盒子也应用 hosts」）。
 - **不在盒子上手抄文件**：脚本从仓库拉，改 `box/run-probe.ps1` 就等于改了盒子上的行为。
 - 推送用一把**只属于本仓库的 write deploy key**（盒子侧 `D:\accel\.ssh\box_deploy`）；拉取是公开读，不需要凭据。
   要停用：GitHub → Settings → Deploy keys 删掉那一把（盒子上的任务也可以直接 `schtasks /End /TN AccelProbe`）。
@@ -152,6 +153,16 @@ runner 在数据中心，**排名对它没有意义**。真正像用户线路的
 
 本机 `gh.mjs` 把两个观测点的清单取**并集**（盒子在前，见 `config.json` 的 `manifest.urls`；被 `max_entries`
 截断时留下的是盒子的入口）。`doctor` 会把来源打印成 `box-shandong(4) + runner(8)`，一眼看出哪份来自谁。
+
+#### 盒子也应用 hosts（热更新）
+
+盒子不只是观测点——它跑在真实国内线路上，所以同一套 `accel.mjs` 在盒子上也能产出**针对盒子这条线**的最优 hosts 钉，写进盒子自己的 `C:\Windows\System32\drivers\etc\hosts` 的 `# >>> accel-start >>>` 块。这样盒子这台常开机器访问 GitHub 也走加速，且**随线路自动重测重写**。
+
+- 触发：复用 `AccelProbe` 任务的同一次 6 小时循环（`box/run-probe.ps1` 第 4 步 `Apply-Hosts`），**不新增任务、不新增 SSH 依赖**。盒子每轮先 `git pull` 最新脚本，所以这里改 `box/run-probe.ps1` 就等于改了盒子行为。
+- 写文件前先**可写性预检**：盒子若没有管理员写 hosts 的权限，`accel.mjs` 直接 no-op（写日志、不碰文件），不会把任务跑挂。
+- `hosts` 块与本机**独立**：盒子钉的是盒子线路实测最优值，本机钉的是本机线路最优值，二者不共享——这正是「IP 优劣强依赖线路」这条结论的应用。
+- 审计：盒子侧 `D:\accel\logs\hosts-*.log` 记录每轮 apply 的退出码与 `accel.mjs` 输出。
+- 停用 hosts 应用：删掉 `box/run-probe.ps1` 里的 `Apply-Hosts` 调用（或 `node accel.mjs --revert` 回滚盒子 hosts 块）。
 
 装/重装盒子任务（一次性，只在重建时用）：
 

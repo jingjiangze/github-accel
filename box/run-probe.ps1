@@ -17,6 +17,36 @@
 
 $ErrorActionPreference = 'Continue'
 
+# Apply the accel hosts layer on the box itself. The box sits on a real Chinese line, so
+# running accel.mjs here produces a hosts block tuned for THIS machine -- not a copy of the
+# user's local one. Running it inside this same pull-then-run loop means the box re-measures
+# and rewrites its own hosts every $Every seconds: that IS the hot update.
+# accel.mjs only writes the # >>> accel-start >>> block; if the file is not writable (no
+# admin) or measurement finds nothing better than system DNS, it logs and touches nothing.
+function Apply-Hosts {
+  $HostsPath = 'C:\Windows\System32\drivers\etc\hosts'
+  try {
+    # writability precheck: accel.mjs needs to rewrite this file; without admin it must no-op
+    $test = Join-Path $env:TEMP ('accel-w-' + [guid]::NewGuid().ToString('N'))
+    [IO.File]::WriteAllText($test, '')
+    Remove-Item $test -Force
+  } catch {
+    Write-Log ('hosts NOT writable - skip accel.mjs apply: ' + $_.Exception.Message)
+    return
+  }
+  $env:ACCEL_VANTAGE = 'box-shandong'
+  $applyLog = Join-Path $LogDir ('hosts-' + (Get-Date -Format 'yyyyMMdd-HHmmss') + '.log')
+  Push-Location $Repo
+  try {
+    & $Node accel.mjs *> $applyLog
+    Write-Log ('accel.mjs hosts apply exit=' + $LASTEXITCODE)
+  } catch {
+    Write-Log ('accel.mjs hosts apply error: ' + $_.Exception.Message)
+  } finally {
+    Pop-Location
+  }
+}
+
 $Root   = 'D:\accel'
 $Repo   = Join-Path $Root 'repo'
 $Pub    = Join-Path $Root 'publish'
@@ -82,6 +112,9 @@ while ($true) {
     & git -C $Pub remote add origin git@github.com:jingjiangze/github-accel.git
     $push = (& git -C $Pub push -q -f origin $Branch 2>&1 | Out-String).Trim()
     Write-Log ('publish exit=' + $LASTEXITCODE + ' ' + $push)
+
+    # 4. hot-update the box's OWN hosts file with this line's best picks
+    Apply-Hosts
   } catch {
     Write-Log ('error: ' + $_.Exception.Message)
   }
