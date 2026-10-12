@@ -13,12 +13,32 @@
 
 | 层 | 文件 | 解决什么 |
 |---|---|---|
-| A 自适应 hosts | `accel.mjs`（+ `ip` / `probe` / `hostsio` 三个模块） | 头像、raw、归档包、npm/jsDelivr 等**能靠 IP 救**的通道：候选 IP 逐条本机 TLS 实测，只有确实更快才写入 |
+| A 自适应 hosts | `accel.mjs`（+ `ip` / `probe` / `hostsio` 三个模块） | 头像、raw、归档包、npm/jsDelivr、PyPI、SourceForge、cdnjs/unpkg 等**能靠 IP 救**的通道：候选 IP 逐条本机 TLS 实测，只有确实更快才写入 |
 | B 竞速取件 | `gh.mjs` | `github.com` 首跳、release 下载、`git clone` 这类**换 IP 无效**的通道：每次请求同时压多个入口，先出数据的胜出，停滞带 Range 换源续传 |
 
 设计取向是**宁可不写，也不写坏**：写错的 hosts 条目比不写更糟（浏览器全站受影响），所以每条固定都要过"多轮实测 + 写入后真实解析复核"。复核若发现真实解析落到了**没钉的那一族**，先按族补钉（用另一族实测可用的候选）再复核第二轮，补不上才整域撤销。该判定（`planAfterLeak`）可用 `node accel.mjs --selftest` 离线回归。
 
 v2（2026-10-13）把这套守护做细了：落地复核 = **系统解析整链检查 + 每族 `--resolve` 直检**，任一项失败先重试 1 次再判决；某一族直检失败只撤那一族（旧版只能整域撤）。判定拆进三个可离线回归的模块：`ip.mjs`（`net.isIP` 严格校验 + v6 前缀归一）、`probe.mjs`（解析/判定纯函数）、`hostsio.mjs`（备份+直写+读回的安全提交）。
+
+## 覆盖哪些域（2026-10-13 实测口径）
+
+**进 A 层的域 = 「换 IP 救得回来」+「有可信候选源」两个条件都满足**，不是列得越多越好：
+
+| 分类 | 域 | 候选来源 |
+|---|---|---|
+| GitHub | `github.com`、`api.github.com`、`codeload.github.com`、`raw`/`objects`/`avatars`/`githubassets` | GitHub `/meta`（带缓存兜底）+ DoH + 第三方 hosts hint |
+| Cloudflare 前置 | `cdn.jsdelivr.net`、`registry.npmjs.org`、`sourceforge.net`、`downloads.sourceforge.net`、`cloudflare.com`、`cdnjs.cloudflare.com`、`unpkg.com` | Cloudflare `ips-v4`/`ips-v6`（官方）+ DoH |
+| Fastly 前置 | `pypi.org`、`files.pythonhosted.org` | Fastly `public-ip-list`（官方）+ DoH |
+
+**实测收益**：`pypi.org` 系统解析 5847ms → 钉到 `2a04:4e42::223` 后 **285ms**（≈20×）；
+`files.pythonhosted.org` 2659ms → 185ms。
+
+**为什么没有 Google / YouTube / Wikipedia / archive.org / huggingface / docker / reddit**（同日审计结论，
+证据在 `_tmp/multi-site-accel-2026-10-13/findings.md`）：本机线路上这些域**双重受阻**——
+① DNS 被污染（`www.google.com` 被解析到 Facebook 段 `69.171.235.22`，连 `www.example.com` 都拿到 Cloudflare 段）；
+② **真实 IP 直连也不通**（经代理 DoH 拿到真 IP 后逐个 `--resolve` 实测：Google/Wikipedia/archive/huggingface/docker/reddit
+全部超时或连接重置）。hosts 层对它们无效，硬写只会把用户导到连不上的 IP。这类域要靠代理或反代（B 层机制），
+不是 A 层的职责。
 
 ## 快速开始
 

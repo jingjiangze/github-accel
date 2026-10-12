@@ -209,6 +209,26 @@ async function main() {
     log(key + '：' + cidrs.length + ' 段 -> ' + (D.cf_domains || []).join('/'))
   }
 
+  // 3b) Fastly 官方网段（JSON；给 Fastly 前置的域）
+  //     2026-10-13 多站点扩展：pypi.org / files.pythonhosted.org 走 Fastly，
+  //     官方列表 https://api.fastly.com/public-ip-list 形态是 { addresses:[...], ipv6_addresses:[...] }
+  if (D.fastly_ip_list && D.fastly_ip_list.url) {
+    const text = await fetchSrc(D.fastly_ip_list, 30000)
+    let v4 = [], v6 = []
+    try { const j = JSON.parse(text); v4 = j.addresses || []; v6 = j.ipv6_addresses || [] } catch (e) {}
+    const cidrs4 = v4.filter(function (s) { return String(s).indexOf('/') > 0 })
+    const cidrs6 = v6.filter(function (s) { return String(s).indexOf('/') > 0 })
+    if (!cidrs4.length) { log('fastly_ip_list 取不到，跳过') }
+    else {
+      sources.fastly_ip_list = cidrs4.length + cidrs6.length
+      for (const dom of (D.fastly_domains || [])) {
+        for (const cidr of cidrs4) for (const ip of sampleCidr4(cidr, per24, rnd)) add(dom, ip, 'fastly')
+        for (const cidr of cidrs6) for (const ip of sampleCidr6(cidr, 1)) add(dom, ip, 'fastly6')
+      }
+      log('fastly_ip_list：' + cidrs4.length + ' v4 段 + ' + cidrs6.length + ' v6 段 -> ' + (D.fastly_domains || []).join('/'))
+    }
+  }
+
   // 4) 第三方列表：只当 hint，不直接写 hosts；也只留本项目关心的域（列表里几百个域与本工具无关）
   //    源支持 "url 字符串" 或 { url, via } 两种写法
   const wanted = new Set(Object.keys(CFG.domains || {}))
