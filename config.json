@@ -16,6 +16,7 @@
     "github_meta": { "url": "https://api.github.com/meta", "via": "direct" },
     "cf_ips4": { "url": "https://www.cloudflare.com/ips-v4", "via": "direct" },
     "cf_ips6": { "url": "https://www.cloudflare.com/ips-v6", "via": "direct" },
+    "fastly_ip_list": { "url": "https://api.fastly.com/public-ip-list", "via": "direct" },
     "doh": [
       { "url": "https://cloudflare-dns.com/dns-query?name=DOMAIN&type=TYPE", "via": "proxy", "header": "accept: application/dns-json" },
       { "url": "https://dns.google/resolve?name=DOMAIN&type=TYPE", "via": "proxy" }
@@ -23,6 +24,7 @@
     "sample_per_24": 1,
     "max_per_domain": 64,
     "cf_domains": ["cdn.jsdelivr.net", "registry.npmjs.org"],
+    "fastly_domains": ["pypi.org", "files.pythonhosted.org"],
     "gh_domains": {
       "github.com": ["web"],
       "api.github.com": ["api", "web"],
@@ -99,7 +101,14 @@
     "gist.github.com": { "canary": "/", "expect": [200] },
     "github.com": { "canary": "/", "expect": [200], "strict": true, "min_bytes": 8192, "max_ms": 4000 },
     "cdn.jsdelivr.net": { "canary": "/npm/react/package.json" },
-    "registry.npmjs.org": { "canary": "/react" }
+    "registry.npmjs.org": { "canary": "/react" },
+    "pypi.org": { "canary": "/simple/requests/", "expect": [200], "min_bytes": 1024 },
+    "files.pythonhosted.org": { "canary": "/" },
+    "sourceforge.net": { "canary": "/", "expect": [200, 301, 403, 404], "min_bytes": 512 },
+    "downloads.sourceforge.net": { "canary": "/" },
+    "cloudflare.com": { "canary": "/" },
+    "cdnjs.cloudflare.com": { "canary": "/ajax/libs/react/18.2.0/package.json" },
+    "unpkg.com": { "canary": "/react@18.3.1/package.json", "expect": [200] }
   },
   "static_ips": {
     "github.com": ["20.205.243.165", "140.82.112.4", "140.82.113.4", "140.82.114.4", "140.82.116.4", "20.29.134.23"],
