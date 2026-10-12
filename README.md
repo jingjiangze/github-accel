@@ -68,6 +68,26 @@ powershell -NoProfile -ExecutionPolicy Bypass -File repair-hosts.ps1
 - **候选源**：新增 ineo6/hosts（GitLab 活跃源）为第三提示源；`/meta` 限流时用 `meta-cache.json` 上次成功结果兜底（TTL 7 天）。
 - **回退**：`node accel.mjs --revert`（移除标记块）；应急 `repair-hosts.ps1`（缺失恢复）；代码层面 `git revert`。
 
+## 资源占用（本机最小服务约束）
+
+无常驻进程：全部行为由计划任务短跑触发（`wscript → run-hidden.vbs → node accel.mjs`，跑完即退）。
+唯一需要守住的数字是**单轮进程内存峰值**，用 `maxRSS`（Windows = PeakWorkingSet）量，不用 `heapUsed`
+（本工具大量用 Buffer 存 curl 输出，只看堆会严重低估）：
+
+| 进程 | 实测峰值（2026-10-13） | 预算 |
+|---|---|---|
+| `accel.mjs`（选路 + 落地复核 + 入口体检） | **52.5 MB** | 100 MB |
+| `gh.mjs doctor`（入口体检） | **47.6 MB** | 100 MB |
+
+```bat
+node bench.mjs            :: 跑一轮并打印两个进程的峰值 + 运行期文件体积
+node bench.mjs --check    :: 同上，超预算时退出码非 0（可接计划任务/CI）
+```
+
+内存与状态文件体积是联动的：`pool-state.json`（历史观测）由 `pool.state_max_age_days`（默认 45 天）裁剪，
+`candidates.json` / `meta-cache.json` 每轮按 TTL 重写——这三个文件就是内存的主要来源，
+bench 会把它们的当前体积一并打印出来便于追踪。
+
 ## 发行包（只含运行文件）
 
 不想 clone 的话，下载滚动发行包：
@@ -81,7 +101,7 @@ powershell -NoProfile -ExecutionPolicy Bypass -File repair-hosts.ps1
 
 | 进包（20 个） | 不进包 |
 |---|---|
-| `accel.mjs`、`ip.mjs`、`probe.mjs`、`hostsio.mjs`、`gh.mjs`、`manifest.mjs`、`discover.mjs`、`pool.mjs`、`config.json`、`manifest-seed.json`、`install-task.ps1`、`repair-hosts.ps1`、`run-hidden.vbs`、`box/run-probe.ps1`、`box/install-task.ps1`、`relay/`（`wrangler.toml` + `functions/` + `public/`）、`README.md`、`LICENSE` | `.github/`（CI）、`.gitignore`、`relay/test/`（测试），以及所有运行期产物（`logs/`、`backups/`、`report.json`、`proxy-state.json`、`candidates.json`、`pool-state.json`、`manifest-cache.json`、`meta-cache.json`、`dist/`、`run.lock`、`relay-key`） |
+| `accel.mjs`、`ip.mjs`、`probe.mjs`、`hostsio.mjs`、`gh.mjs`、`manifest.mjs`、`discover.mjs`、`pool.mjs`、`bench.mjs`、`config.json`、`manifest-seed.json`、`install-task.ps1`、`repair-hosts.ps1`、`run-hidden.vbs`、`box/run-probe.ps1`、`box/install-task.ps1`、`relay/`（`wrangler.toml` + `functions/` + `public/`）、`README.md`、`LICENSE` | `.github/`（CI）、`.gitignore`、`relay/test/`（测试），以及所有运行期产物（`logs/`、`backups/`、`report.json`、`proxy-state.json`、`candidates.json`、`pool-state.json`、`manifest-cache.json`、`meta-cache.json`、`dist/`、`run.lock`、`relay-key`） |
 
 ```bat
 node pack.mjs --selftest                  :: CRC32 标准向量 + ZIP 读写往返 + 白名单断言（不联网）

@@ -43,6 +43,7 @@ const RUNTIME_FILES = [
   'manifest.mjs',       // 反代入口体检 -> 清单
   'discover.mjs',       // 候选发现
   'pool.mjs',           // 健康池
+  'bench.mjs',          // 资源自查（内存预算/运行期体积）
   'config.json',
   'manifest-seed.json',
   'install-task.ps1',   // 本机计划任务
