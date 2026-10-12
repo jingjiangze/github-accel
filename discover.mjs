@@ -8,6 +8,7 @@ import fs from 'node:fs'
 import path from 'node:path'
 import { execFile } from 'node:child_process'
 import { fileURLToPath } from 'node:url'
+import { fam, isV4, isV6, num4, str4 } from './ip.mjs'
 
 const HERE = path.dirname(fileURLToPath(import.meta.url))
 const CFG = JSON.parse(fs.readFileSync(path.join(HERE, 'config.json'), 'utf8'))
@@ -26,21 +27,8 @@ function run(exe, args, timeoutMs) {
       function (err, out) { resolve({ code: err ? 1 : 0, stdout: out || '' }) })
   })
 }
+// ---------- 纯函数（可离线自测）；IP 形式校验统一在 ip.mjs（net.isIP 严格） ----------
 function rnd() { return Math.random() }
-
-// ---------- 纯函数（可离线自测） ----------
-function num4(ip) {
-  const p = String(ip).trim().split('.')
-  return (((+p[0]) << 24) | ((+p[1]) << 16) | ((+p[2]) << 8) | (+p[3])) >>> 0
-}
-function str4(n) { return [(n >>> 24) & 255, (n >>> 16) & 255, (n >>> 8) & 255, n & 255].join('.') }
-function isV4(s) { return /^\d{1,3}(\.\d{1,3}){3}$/.test(String(s).trim()) }
-// 形式收严（2026-10-13）：宽松正则配拼串曾产出 "2606:50c0:8000:::1" 这类三冒号垃圾并混进候选池；
-// 这里显式挡掉（只做形式校验，不做逐组范围校验）
-function isV6(s) {
-  const t = String(s).trim()
-  return t.indexOf(':') >= 0 && /^[0-9a-fA-F:]+$/.test(t) && t.indexOf(':::') < 0 && t.split('::').length <= 2
-}
 
 // 每个 /24 抽 per24 个，而不是把整个网段扫完（CloudflareSpeedTest 就是这么控成本的）
 function sampleCidr4(cidr, per24, rand) {
@@ -116,7 +104,6 @@ function parseThirdParty(text) {
   }
   return map
 }
-function fam(ip) { return isV4(ip) ? 4 : (isV6(ip) ? 6 : 0) }
 function readMetaCache() {
   try { return JSON.parse(fs.readFileSync(META_CACHE, 'utf8')) } catch (e) { return null }
 }
@@ -223,9 +210,12 @@ async function main() {
   }
 
   // 4) 第三方列表：只当 hint，不直接写 hosts；也只留本项目关心的域（列表里几百个域与本工具无关）
+  //    源支持 "url 字符串" 或 { url, via } 两种写法
   const wanted = new Set(Object.keys(CFG.domains || {}))
-  for (const url of (CFG.sources || [])) {
-    const text = await fetchSrc({ url: url, via: 'direct' }, 20000)
+  for (const item of (CFG.sources || [])) {
+    const url = typeof item === 'string' ? item : item.url
+    const via = typeof item === 'string' ? 'direct' : (item.via || 'direct')
+    const text = await fetchSrc({ url: url, via: via }, 20000)
     const map = parseThirdParty(text)
     let n = 0
     for (const dom of Object.keys(map)) {
@@ -249,7 +239,9 @@ async function main() {
   if (VERBOSE) for (const d of Object.keys(domains)) log('  ', d.padEnd(30), domains[d].length + ' 个', '[' + dedupe(domains[d].map(function (x) { return x.src.split(':')[0] })).join(',') + ']')
 }
 
-if (ARGV.includes('--selftest')) {
+// 自测仅在本文件是入口时运行（防止劫持导入者的 --selftest）
+const isMain = process.argv[1] && path.resolve(process.argv[1]) === path.resolve(fileURLToPath(import.meta.url))
+if (isMain && ARGV.includes('--selftest')) {
   let bad = 0
   const T = function (name, got, want) {
     const ok = JSON.stringify(got) === JSON.stringify(want)
