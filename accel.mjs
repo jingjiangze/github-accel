@@ -1,10 +1,22 @@
-// 本机自适应 hosts：候选 IP（含 IPv6）全部来自实测，只有真的比现状快才写入
+// accel.mjs —— 本机自适应 hosts（v2，2026-10-13 全面重写）
+// 候选 IP（含 IPv6）全部来自实测，只有真的比现状快才写入；写后用"整链 + 分族"两层复核兜底。
+//
+// v2 相对旧版的关键变化（依据 2026-10-13 审计 + 当日事故教训）：
+//   1. 判定/解析/文件 IO 收口到模块：ip.mjs（net.isIP 严格校验）、probe.mjs（判定纯函数）、hostsio.mjs（安全提交）。
+//   2. 落地复核 = 系统解析整链检查 + 每族 --resolve 直检；任一失败先重试 1 次再判决；
+//      分族失败只撤该族（旧版只能整域撤）。
+//   3. hosts 写入 = 写前备份 + 直写 + 写后逐字节读回（失败重写一次 → 仍失败从备份恢复并中止本轮）。
+//      （rename / File.Replace 在本机实测均不可用，File.Replace 还会在失败时移走目标——永久禁用，见 hostsio.mjs 头注）
+//   4. hosts 缺失（重建需提权）→ 本轮拒绝进入，指向 repair-hosts.ps1。
 import fs from 'node:fs'
 import path from 'node:path'
 import { execFile } from 'node:child_process'
 import { fileURLToPath } from 'node:url'
 import { promises as dnsp } from 'node:dns'
 import { open as openPool } from './pool.mjs'
+import { fam, isFakeIp, isLocalIp } from './ip.mjs'
+import { parseProbeOut, parseVerifyOut, judgeProbe, summarizeProbes, judgeVerify } from './probe.mjs'
+import { readHosts, parsePins, commitHosts } from './hostsio.mjs'
 
 const HERE = path.dirname(fileURLToPath(import.meta.url))
 // 候选健康池（pool.mjs）：每轮只探一小撮，探完写回历史。未启用时为 null，走旧的候选来源。
@@ -19,8 +31,6 @@ const DRY = ARGV.includes('--dry')
 const REVERT = ARGV.includes('--revert')
 const VERBOSE = ARGV.includes('-v')
 const SELFTEST = ARGV.includes('--selftest')
-const IPV4 = /^\d{1,3}(\.\d{1,3}){3}$/
-const IPV6 = /^[0-9a-f:]+$/i
 const DOMRE = /^[a-z0-9._-]+$/i
 
 function now() { return new Date().toISOString().slice(11, 19) }
@@ -54,18 +64,6 @@ function acquireLock() {
 }
 function releaseLock() { try { fs.unlinkSync(LOCK) } catch (e) {} }
 
-// 系统代理（Clash 混合端口）是否可用：可用时 github.com 这类主域交给它，
-// 因为实测该域直连候选在 000 与 0.5s 之间反复翻，而代理 4/4 稳定；代理挂了才由 hosts 顶上。
-async function proxyGate() {
-  const g = CFG.proxy_gate
-  if (!g || !g.enabled) return { alive: false, ms: 0, skipped: false }
-  const r = await run('curl.exe', ['-sS', '-o', 'NUL', '--ssl-no-revoke', '-x', g.proxy, '--connect-timeout', '4',
-    '--max-time', String(Math.ceil((g.timeout_ms || 8000) / 1000)), '-w', '%{http_code} %{time_total}', g.test_url], (g.timeout_ms || 8000) + 4000)
-  const m = r.stdout.match(/^(\d+)\s+([\d.]+)/)
-  const code = m ? Number(m[1]) : 0
-  return { alive: code >= 200 && code < 400, ms: m ? Math.round(Number(m[2]) * 1000) : 1e9, domains: g.handoff_domains || [] }
-}
-
 function run(exe, args, timeoutMs) {
   return new Promise(function (resolve) {
     execFile(exe, args, { maxBuffer: 32 * 1024 * 1024, windowsHide: true, timeout: timeoutMs || 25000, encoding: 'utf8' },
@@ -87,111 +85,50 @@ async function pool(items, size, worker) {
   await Promise.all(Array.from({ length: Math.max(1, Math.min(size, items.length)) }, slot))
   return out
 }
-// v6 形式收严（2026-10-13）：IPV6 宽松正则会接受 "2606:50c0:8000:::1" 这种三冒号垃圾，
-// hosts 读取与候选池过滤都经过 fam()，先把非法形式挡掉（否则垃圾被当有效 v6 钉进 hosts）
-function isV6Form(ip) {
-  const t = String(ip)
-  return IPV6.test(t) && t.indexOf(':') >= 0 && t.indexOf(':::') < 0 && t.split('::').length <= 2
-}
-function fam(ip) { return IPV4.test(ip) ? 4 : (isV6Form(ip) ? 6 : 0) }
 
-// 代理内核（mihomo/Clash）的 fake-ip 段。系统解析落在这里 = DNS 被 TUN 的 dns-hijack 接管：
-// 此时 hosts 层被架空，写进去的固定也必然复核失败，工具会把自己上一轮的固定全部撤销。
-// 关掉 TUN 之后解析还会在缓存里残留一段 fake-ip，那段时间直连是「全都连不上」的。
+// 代理内核（mihomo/Clash）fake-ip 段检测绑定（段定义与判定在 ip.mjs）
 const FAKE4 = CFG.fake_ip_ranges4 || ['198.18.0.0/16']
 const FAKE6 = CFG.fake_ip_ranges6 || ['fdfe:dcba:9876::/64']
-function num4(ip) {
-  const p = ip.split('.')
-  return (((+p[0]) << 24) | ((+p[1]) << 16) | ((+p[2]) << 8) | (+p[3])) >>> 0
-}
-function norm6(ip) {
-  const parts = String(ip).split('%')[0].toLowerCase().split('::')
-  const head = parts[0] ? parts[0].split(':') : []
-  const tail = parts.length > 1 && parts[1] ? parts[1].split(':') : []
-  const pad = new Array(Math.max(0, 8 - head.length - tail.length)).fill('0')
-  return head.concat(pad, tail)
-}
-function inRange6(ip, cidr) {
-  const c = String(cidr).split('/')
-  const a = norm6(ip), b = norm6(c[0])
-  let bits = Number(c[1] || 128)
-  for (let i = 0; i < 8 && bits > 0; i++) {
-    const take = Math.min(16, bits)
-    const mask = take >= 16 ? 0xffff : ((0xffff << (16 - take)) & 0xffff)
-    if ((parseInt(a[i] || '0', 16) & mask) !== (parseInt(b[i] || '0', 16) & mask)) return false
-    bits -= take
-  }
-  return true
-}
-function isFakeIp(ip) {
-  if (!ip) return false
-  const f = fam(ip)
-  if (f === 4) return FAKE4.some(function (c) {
-    const p = String(c).split('/')
-    const mask = p[1] ? ((~0 << (32 - Number(p[1]))) >>> 0) : 0xffffffff
-    return (num4(ip) & mask) === (num4(p[0]) & mask)
-  })
-  if (f === 6) return FAKE6.some(function (c) { return inRange6(ip, c) })
-  return false
-}
-// 公网域名解析到回环/内网地址 = 环境被本地代理或内核接管，这种"解析"不能当泄漏证据
-function isLocalIp(ip) {
-  if (!ip) return false
-  const f = fam(ip)
-  if (f === 4) {
-    const n = num4(ip)
-    const inR = function (c) {
-      const p = String(c).split('/')
-      const mask = ((~0 << (32 - Number(p[1]))) >>> 0)
-      return (n & mask) === (num4(p[0]) & mask)
-    }
-    return inR('127.0.0.0/8') || inR('10.0.0.0/8') || inR('172.16.0.0/12') || inR('192.168.0.0/16') || inR('169.254.0.0/16')
-  }
-  if (f === 6) return inRange6(ip, '::1/128') || inRange6(ip, 'fe80::/10') || inRange6(ip, 'fc00::/7')
-  return false
-}
+function isFake(ip) { return isFakeIp(ip, FAKE4, FAKE6) }
 // 用不作为候选的域看系统解析是否落在 fake-ip 段（命中就说明代理内核正接管 DNS）
 async function fakeEnv() {
   const dom = CFG.fake_ip_probe_domain || 'www.example.com'
   const a4 = await sysA(dom), a6 = await sysAAAA(dom)
-  const hit = [a4, a6].filter(Boolean).find(function (ip) { return isFakeIp(ip) }) || null
+  const hit = [a4, a6].filter(Boolean).find(function (ip) { return isFake(ip) }) || null
   return { active: !!hit, ip: hit, domain: dom, a4, a6 }
 }
 // 上一轮自己写进 hosts 的固定：baseline 命中它们时，是"我的钉在起作用"，
 // 不能当「现状已是最优」把钉丢掉——系统 DNS 本身未必给得出这个 IP
 function readPrevPins() {
-  const m = new Map()
-  try {
-    const t = fs.readFileSync(CFG.hosts_path, 'utf8')
-    const i = t.indexOf(MARK_S), j = t.indexOf(MARK_E, i)
-    if (i < 0 || j < 0) return m
-    for (const line of t.slice(i, j).split(/\r?\n/)) {
-      const s = line.trim()
-      if (!s || s.charAt(0) === '#') continue
-      const p = s.split(/\s+/)
-      if (p.length >= 2 && fam(p[0]) && DOMRE.test(p[1])) {
-        if (!m.has(p[1])) m.set(p[1], new Set())
-        m.get(p[1]).add(p[0])
-      }
-    }
-  } catch (e) {}
-  return m
+  const cur = readHosts(CFG.hosts_path)
+  if (cur === null) return new Map()
+  return parsePins(cur, MARK_S, MARK_E, function (ip) { return fam(ip) > 0 }, function (d) { return DOMRE.test(d) })
 }
 const PREV = readPrevPins()
 function prevHas(dom, ip) { const s = PREV.get(dom); return !!(s && ip && s.has(ip)) }
 
-async function fetchText(url, ms) {
-  const r = await run('curl.exe', ['-sS', '-g', '--compressed', '--ssl-no-revoke', '--connect-timeout', '5', '--max-time', String(Math.ceil(ms / 1000)), url], ms + 5000)
+// 第三方 hosts 列表（只当 hint）：支持 "url 字符串" 或 { url, via } 两种写法
+function fetchArgs(url, via) {
+  const a = ['-sS', '-g', '--compressed', '--ssl-no-revoke', '--connect-timeout', '5', '--max-time', '15']
+  if (via === 'proxy' && CFG.discovery && CFG.discovery.proxy) a.push('-x', CFG.discovery.proxy)
+  else a.push('--noproxy', '*')
+  a.push(url)
+  return a
+}
+async function fetchText(url, ms, via) {
+  const r = await run('curl.exe', fetchArgs(url, via), (ms || 15000) + 5000)
   return r.stdout.length > 40 ? r.stdout : ''
 }
 async function loadRemoteCandidates() {
   const map = {}
-  for (const url of CFG.sources) {
-    const text = await fetchText(url, 15000)
+  for (const item of CFG.sources) {
+    const url = typeof item === 'string' ? item : item.url
+    const via = typeof item === 'string' ? 'direct' : (item.via || 'direct')
+    const text = await fetchText(url, 15000, via)
     if (!text) { if (VERBOSE) log('源失败', url); continue }
     let n = 0
     for (const line of text.split(/\r?\n/)) {
-      const m = line.match(/^(\d{1,3}(?:\.\d{1,3}){3}|[0-9a-f:]+)\s+([a-z0-9._-]+)$/i)
+      const m = line.match(/^(\d{1,3}(?:\.\d{1,3}){3}|[0-9a-fA-F:]+)\s+([a-z0-9._-]+)$/i)
       if (!m || !fam(m[1])) continue
       const dom = m[2].toLowerCase()
       if (!map[dom]) map[dom] = new Set()
@@ -228,17 +165,12 @@ async function probeOnce(dom, ip, canary) {
   const r = await run('curl.exe', ['-sS', '-o', 'NUL', '--noproxy', '*', '--ssl-no-revoke', '--connect-timeout', '4',
     '--max-time', String(Math.ceil(CFG.probe.budget_ms / 1000)), '-w', '%{http_code} %{time_total} %{size_download} %{remote_ip}',
     '--resolve', dom + ':443:' + ip, url], CFG.probe.budget_ms + 6000)
-  const m = r.stdout.match(/^(\d+)\s+([\d.]+)\s+(\d+)\s+(\S+)/)
-  if (!m) return { ok: false, ms: 1e9, code: 0, bytes: 0, rip: '' }
-  const code = Number(m[1]), ms = Math.round(Number(m[2]) * 1000), bytes = Number(m[3])
-  // 语义正确才算数：错误后端返回的 400 页比卡死更危险，会静默把域名指到别的服务上。
-  // min_bytes 是给 github.com 这类"200 + 头几 KB 后就卡死"的假健康节点准备的：拿到几个字节不算通。
-  const allow = allowedCodes(dom)
-  const minBytes = (CFG.domains[dom] || {}).min_bytes || CFG.probe.min_bytes || 1
-  // max_ms：慢到离谱的候选（实测 github.com 有 8026ms 仍返回 200 的）不值得写进去——
-  // 写进去复核也会被撤，白折腾一轮 hosts 和 DNS 缓存
-  const maxMs = (CFG.domains[dom] || {}).max_ms || 0
-  return { ok: allow.indexOf(code) >= 0 && bytes >= minBytes && (!maxMs || ms <= maxMs), ms, code, bytes, rip: m[4] }
+  const conf = CFG.domains[dom] || {}
+  return judgeProbe(parseProbeOut(r.stdout), {
+    allow: allowedCodes(dom),
+    minBytes: conf.min_bytes || CFG.probe.min_bytes || 1,
+    maxMs: conf.max_ms || 0
+  })
 }
 async function probe(dom, ip, canary) {
   // 默认严格：每一轮都必须通过才认定可用，取最慢一轮计时——单轮侥幸通过会把抖动 IP 固定进去
@@ -249,52 +181,58 @@ async function probe(dom, ip, canary) {
     rs.push(r)
     if (!strict && r.ok) break
   }
-  const good = rs.filter(function (r) { return r.ok })
-  if (!good.length) return { ok: false, ms: 1e9, code: rs[rs.length - 1].code, bytes: 0, tries: rs.length }
-  const times = good.map(function (r) { return r.ms })
-  const ms = strict ? Math.max.apply(null, times) : Math.min.apply(null, times)
-  return { ok: strict ? good.length === rs.length : true, ms, code: good[0].code, bytes: good[0].bytes, tries: rs.length }
-}
-function stripBlock(text) {
-  const i = text.indexOf(MARK_S)
-  if (i < 0) return text
-  const j = text.indexOf(MARK_E, i)
-  return j < 0 ? text : text.slice(0, i) + text.slice(j + MARK_E.length)
-}
-function writeHosts(block) {
-  const cur = fs.readFileSync(CFG.hosts_path, 'utf8')
-  const rest = stripBlock(cur).replace(/[\r\n]+$/, '')
-  const out = rest + '\r\n' + block + '\r\n'
-  // dry-run 只算出目标内容，不落盘、也不建 backups/
-  if (DRY) return out
-  const bdir = path.join(HERE, 'backups')
-  fs.mkdirSync(bdir, { recursive: true })
-  fs.writeFileSync(path.join(bdir, 'hosts-' + new Date().toISOString().replace(/[:.]/g, '-').slice(0, 19)), cur)
-  const all = fs.readdirSync(bdir).filter(function (f) { return f.indexOf('hosts-') === 0 }).sort()
-  while (all.length > 5) fs.unlinkSync(path.join(bdir, all.shift()))
-  fs.writeFileSync(CFG.hosts_path, out)
-  return out
+  return summarizeProbes(rs, strict)
 }
 
-// 哪些候选真的写进 hosts。抽成纯函数是为了能离线回归——这里踩过
-// "v4 1012ms 被 v6 1948ms 顶掉"的坑（见 --selftest 用例）。
-function betterThan(cand, base, ratio) {
-  if (!cand) return false
-  if (!base || !base.ok) return true
-  if (cand.ip === base.ip) return false
-  return cand.ms < base.ms * ratio
+// ---------- 落地复核（v2：整链 + 分族，各失败重试 1 次） ----------
+async function verifySystemOnce(dom, canary) {
+  const url = 'https://' + dom + (canary || '/')
+  const r = await run('curl.exe', ['-sS', '-o', 'NUL', '--noproxy', '*', '--ssl-no-revoke', '--connect-timeout', '4', '--max-time', '15',
+    '-w', '%{http_code} %{time_total} %{remote_ip}', url], 20000)
+  return parseVerifyOut(r.stdout)
 }
-function pickPins(pin4, pin6, base4, base6, sysHasV6, ratio) {
-  const take4 = betterThan(pin4, base4, ratio) ? pin4 : null
-  // 无系统 AAAA 时，v6 要和"将要写进去的 v4"比（没有 v4 候选时才是当前 v4）：
-  // 双栈下系统优先试 IPv6，若写入的 v6 比写入的 v4 还慢，等于把 v4 的收益抵消掉
-  // （线上真实踩过两次：v4 1012 被 v6 1948 顶掉；v4 候选 1052 与 v6 2405 同时写入）。
-  // 有 AAAA 基线时仍按族内比（系统本来就优先 v6，改进 v6 才有意义）。
-  // ref4 必须带 ok:true——pin 对象没有 ok 字段，直接当基准会被 betterThan 判成"基准不可用"
-  const ref4 = take4 ? { ip: take4.ip, ok: true, ms: take4.ms } : base4
-  const v6Worth = sysHasV6 ? betterThan(pin6, base6, ratio) : betterThan(pin6, ref4, ratio)
-  const take6 = v6Worth ? pin6 : null
-  return { take4, take6 }
+async function verifyFamilyOnce(dom, canary, ip) {
+  const url = 'https://' + dom + (canary || '/')
+  // 不跟随重定向：跨主机跳转后 %{remote_ip} 是最终跳的 IP，会把自己钉的域判成「泄漏」
+  const r = await run('curl.exe', ['-sS', '-o', 'NUL', '--noproxy', '*', '--ssl-no-revoke', '--connect-timeout', '4', '--max-time', '15',
+    '-w', '%{http_code} %{time_total} %{remote_ip}', '--resolve', dom + ':443:' + ip, url], 20000)
+  return parseVerifyOut(r.stdout)
+}
+async function verifyDomain(dom, canary, pins) {
+  const ctx = { expect: pins.map(function (p) { return p.ip }), allow: allowedCodes(dom), isFake: isFake, isLocal: isLocalIp }
+  const sys = await withRetries(async function () { return judgeVerify(await verifySystemOnce(dom, canary), ctx) })
+  const famChecks = []
+  // 分族直检只在整链 ok 时做（泄漏/无响应交给 planAfterLeak 处理；fake/本地让路时不做）
+  if (sys.kind === 'ok') {
+    for (const p of pins) {
+      const fctx = { expect: [p.ip], allow: ctx.allow, isFake: isFake, isLocal: isLocalIp }
+      const d = await withRetries(async function () { return judgeVerify(await verifyFamilyOnce(dom, canary, p.ip), fctx) })
+      famChecks.push({ fam: p.fam, ip: p.ip, kind: d.kind, detail: d.detail, retried: !!d.retried })
+    }
+  }
+  return { sys: sys, fam: famChecks }
+}
+// 失败重试（默认 1 次，probe.verify_retries 可调）：瞬时抖动不该触发撤销/换钉（2026-10-13）
+const VERIFY_RETRIES = (CFG.probe && CFG.probe.verify_retries !== undefined) ? CFG.probe.verify_retries : 1
+async function withRetries(fn) {
+  let v = await fn()
+  let used = 0
+  while (used < VERIFY_RETRIES && v.kind !== 'ok' && v.kind !== 'inactive') {
+    v = await fn()
+    used++
+    v.retried = true
+  }
+  return v
+}
+
+// 复核失败（泄漏到别处，或连上钉了但响应码不成立）后该怎么办：
+// 失败那一族根本没写过 → 补钉它；已经写过还不成立 → 整域撤销
+function planAfterLeak(c, remote) {
+  const v6 = String(remote).indexOf(':') >= 0
+  const key = v6 ? 'ip6' : 'ip'
+  const alt = v6 ? c.alt6 : c.alt4
+  if (!c[key] && alt) return { action: 'plug', key: key, ip: alt }
+  return { action: 'revoke' }
 }
 
 async function evalDomain(dom, conf, remote) {
@@ -318,7 +256,7 @@ async function evalDomain(dom, conf, remote) {
   const jobs = []
   if (a4) jobs.push({ ip: a4, kind: 'base4' })
   if (a6) jobs.push({ ip: a6, kind: 'base6' })
-  for (const ip of cand) if (ip !== a4 && ip !== a6) jobs.push({ ip, kind: 'cand' })
+  for (const ip of cand) if (ip !== a4 && ip !== a6) jobs.push({ ip: ip, kind: 'cand' })
   const res = await pool(jobs, CFG.probe.concurrency, async function (j) {
     const r = await probe(dom, j.ip, canary)
     return { ip: j.ip, kind: j.kind, fam: fam(j.ip), ok: r.ok, ms: r.ms, code: r.code, bytes: r.bytes }
@@ -353,46 +291,36 @@ async function evalDomain(dom, conf, remote) {
     const ip4 = take4 ? take4.ip : (keep4 || null)
     const ip6 = take6 ? take6.ip : (keep6 || null)
     const ms = (take4 && take4.ms) || (take6 && take6.ms) || (base4 && base4.ms) || 0
-    use = { ip4, ip6, ms }
+    use = { ip4: ip4, ip6: ip6, ms: ms }
     reason = (take4 || take6)
       ? 'v4 ' + (base4 ? base4.ms : '不可用') + '→' + (take4 ? take4.ms : (keep4 ? '保持' : '不写')) +
         '，v6 ' + (base6 ? base6.ms : (sysHasV6 ? '不可用' : '无记录')) + '→' + (take6 ? take6.ms : (keep6 ? '保持' : '不写')) + 'ms'
       : '上一轮固定仍可用（' + ms + 'ms），保持'
   } else reason = '现状已是最优' + (sysHasV6 ? '（系统 AAAA 可直接用）' : '')
-  return { dom, pin4: use ? use.ip4 : null, pin6: use ? use.ip6 : null, pin4ms: use ? use.ms : 0,
+  return { dom: dom, pin4: use ? use.ip4 : null, pin6: use ? use.ip6 : null, pin4ms: use ? use.ms : 0,
     alt4: pin4 ? pin4.ip : null, alt6: pin6 ? pin6.ip : null,
-    base4: base4 || null, base6: base6 || null, sysHasV6, reason, tried: res.length, all: res }
+    base4: base4 || null, base6: base6 || null, sysHasV6: sysHasV6, reason: reason, tried: res.length, all: res }
 }
 
-async function verify(dom, canary, expect) {
-  const url = 'https://' + dom + canary
-  // 不跟随重定向：跨主机跳转后 %{remote_ip} 是最终跳的 IP，会把自己钉的域判成「泄漏」
-  // （avatars.githubusercontent.com/u/1 就是这种：一跳就到别的域）
-  const r = await run('curl.exe', ['-sS', '-o', 'NUL', '--noproxy', '*', '--ssl-no-revoke', '--connect-timeout', '4', '--max-time', '15',
-    '-w', '%{remote_ip} %{http_code} %{time_total}', url], 20000)
-  const m = r.stdout.match(/^(\S+)\s+(\d+)\s+([\d.]+)/)
-  const rip = m ? m[1] : ''
-  // fake-ip / 回环 / 内网地址说明解析被代理内核或本地代理接管了：这次复核说明不了固定对不对，不能据此撤销
-  if (isFakeIp(rip) || isLocalIp(rip)) return { ok: true, inactive: true, remote: rip, detail: '连到 ' + rip + '（fake-ip/本地代理接管），本轮不复核，保留现有固定' }
-  if (!rip) return { ok: false, remote: '', detail: '连接失败 ' + (m ? m[2] : '000') }
-  if (expect.indexOf(rip) < 0) return { ok: false, remote: rip, detail: '泄漏到未钉的 ' + rip + '（写入的是 ' + expect.join('/') + '）' }
-  // 坑（2026-10-13 修）：只核对 remote_ip 不够——TCP 连上但请求挂死/超时时 curl 仍报 remote_ip=钉的 IP、
-  // http_code=000（实测 objects 的 185.199.108.133 拿到 "000 15002ms" 仍被记「生效」，坏钉在 hosts 里留了一整天）。
-  // 落地口径与 probeOnce 对齐：响应码不在允许集里就判落地不成立，交给 planAfterLeak 撤销或补钉。
-  const code = Number(m[2])
-  const allow = allowedCodes(dom)
-  if (allow.indexOf(code) < 0) return { ok: false, remote: rip, detail: rip + ' 响应码 ' + m[2] + '（' + Math.round(Number(m[3]) * 1000) + 'ms）不在允许集 ' + allow.join('/') + '，落地不成立' }
-  return { ok: true, remote: rip, code: code, ms: Math.round(Number(m[3]) * 1000), detail: rip + ' ' + m[2] + ' ' + Math.round(Number(m[3]) * 1000) + 'ms' }
+// 哪些候选真的写进 hosts。抽成纯函数是为了能离线回归——这里踩过
+// "v4 1012ms 被 v6 1948ms 顶掉"的坑（见 --selftest 用例）。
+function betterThan(cand, base, ratio) {
+  if (!cand) return false
+  if (!base || !base.ok) return true
+  if (cand.ip === base.ip) return false
+  return cand.ms < base.ms * ratio
 }
-
-// 复核失败（泄漏到别处，或连上钉了但响应码不成立）后该怎么办：
-// 失败那一族根本没写过 → 补钉它；已经写过还不成立 → 整域撤销
-function planAfterLeak(c, remote) {
-  const v6 = String(remote).indexOf(':') >= 0
-  const key = v6 ? 'ip6' : 'ip'
-  const alt = v6 ? c.alt6 : c.alt4
-  if (!c[key] && alt) return { action: 'plug', key, ip: alt }
-  return { action: 'revoke' }
+function pickPins(pin4, pin6, base4, base6, sysHasV6, ratio) {
+  const take4 = betterThan(pin4, base4, ratio) ? pin4 : null
+  // 无系统 AAAA 时，v6 要和"将要写进去的 v4"比（没有 v4 候选时才是当前 v4）：
+  // 双栈下系统优先试 IPv6，若写入的 v6 比写入的 v4 还慢，等于把 v4 的收益抵消掉
+  // （线上真实踩过两次：v4 1012 被 v6 1948 顶掉；v4 候选 1052 与 v6 2405 同时写入）。
+  // 有 AAAA 基线时仍按族内比（系统本来就优先 v6，改进 v6 才有意义）。
+  // ref4 必须带 ok:true——pin 对象没有 ok 字段，直接当基准会被 betterThan 判成"基准不可用"
+  const ref4 = take4 ? { ip: take4.ip, ok: true, ms: take4.ms } : base4
+  const v6Worth = sysHasV6 ? betterThan(pin6, base6, ratio) : betterThan(pin6, ref4, ratio)
+  const take6 = v6Worth ? pin6 : null
+  return { take4: take4, take6: take6 }
 }
 
 async function main() {
@@ -401,13 +329,22 @@ async function main() {
   if (!DRY) acquireLock()
   if (REVERT) {
     if (DRY) { log('--dry 下不执行回滚（回滚是写操作），去掉 --dry 再跑'); return }
-    if (fs.readFileSync(CFG.hosts_path, 'utf8').indexOf(MARK_S) < 0) { log('hosts 里没有本工具写入的块'); return }
-    writeHosts('')
+    const cur = readHosts(CFG.hosts_path)
+    if (cur === null) { log('hosts 文件不存在，无需回滚（重建需提权，见 repair-hosts.ps1）'); return }
+    if (cur.indexOf(MARK_S) < 0) { log('hosts 里没有本工具写入的块'); return }
+    const r = await commitHosts({ hostsPath: CFG.hosts_path, bdir: path.join(HERE, 'backups'), block: '', markS: MARK_S, markE: MARK_E, keep: 5 })
+    if (!r.ok) { log('回滚写入未成立：' + r.reason + (r.error ? '（' + r.error + '）' : '')) ; process.exitCode = 1; return }
     await run('ipconfig.exe', ['/flushdns'], 10000)
     log('已回滚：accel 块移除，DNS 缓存刷新')
     return
   }
   log('==== 一轮选路开始 ' + (DRY ? '(dry-run)' : '') + ' ====')
+  // hosts 缺失（重建需提权）：拒绝进入，绝不在半坏状态下继续——2026-10-13 事故守卫
+  if (!DRY && readHosts(CFG.hosts_path) === null) {
+    log('hosts 文件缺失：本轮拒绝进入（重建需提权，运行 repair-hosts.ps1；本轮不动任何东西）')
+    process.exitCode = 1
+    return
+  }
   // 交互式 shell 常带 http_proxy/https_proxy：本轮 curl 已用 --noproxy 强制直连，这里只做提示
   const proxied = ['http_proxy', 'https_proxy', 'all_proxy', 'HTTP_PROXY', 'HTTPS_PROXY', 'ALL_PROXY'].filter(function (k) { return process.env[k] })
   if (proxied.length) log('提示：环境里有 ' + proxied.join('/') + '，本轮实测已 --noproxy 强制直连（换空环境跑更接近计划任务的结论）')
@@ -431,18 +368,19 @@ async function main() {
     }
   }
   POOL = openPool(CFG)
+  if (POOL.pruned) log('候选池状态裁剪：移除 ' + POOL.pruned + ' 条过期观测')
   // 池子启用时不再每轮抓第三方列表：候选已经在 candidates.json 里，且它只当 hint
   const remote = POOL.on ? {} : await loadRemoteCandidates()
   log(POOL.on
     ? '候选池已启用：每域每轮探 ' + ((CFG.pool && CFG.pool.probe_per_round) || 8) + ' 个（exploit + explore）'
     : '候选池未启用（缺 candidates.json 或 pool.enabled=false），本轮沿用旧候选来源')
-  const report = { at: new Date().toISOString(), env, pool: { enabled: POOL.on }, domains: {} }
+  const report = { at: new Date().toISOString(), env: env, pool: { enabled: POOL.on }, domains: {} }
   const chosen = []
   for (const dom of Object.keys(CFG.domains)) {
     if (CFG.deny.indexOf(dom) >= 0 || !DOMRE.test(dom)) continue
     const conf = CFG.domains[dom] || {}
     const r = await evalDomain(dom, conf, remote)
-    if (r.pin4 || r.pin6) chosen.push({ dom, ip: r.pin4, ip6: r.pin6, alt4: r.alt4, alt6: r.alt6, canary: conf.canary || '/' })
+    if (r.pin4 || r.pin6) chosen.push({ dom: dom, ip: r.pin4, ip6: r.pin6, alt4: r.alt4, alt6: r.alt6, canary: conf.canary || '/' })
     report.domains[dom] = { baseline: r.base4, baseline6: r.base6, sys_has_aaaa: r.sysHasV6, pinned: r.pin4, pinned6: r.pin6, reason: r.reason, tried: r.tried, probed: r.all }
     log((r.pin4 || r.pin6 ? '固定 ' : '跳过 '), dom.padEnd(28), (r.pin4 || r.pin6 || (r.base4 && r.base4.ok ? r.base4.ip : '-')).padEnd(22),
       String(r.base4 ? r.base4.ms + 'ms' : '无').padEnd(9), String(r.pin4 || r.pin6 ? r.pin4ms + 'ms' : '-').padEnd(9), r.reason)
@@ -454,49 +392,101 @@ async function main() {
       if (c.ip) lines.push(c.ip + '  ' + c.dom)
       if (c.ip6) lines.push(c.ip6 + '  ' + c.dom)
     }
-    return [MARK_S, '# 生成时间 ' + new Date().toISOString(), '# 候选来源 GitHub520 + GitHub-IP-hosts + DoH(A/AAAA) + 内置，全部经本机 TLS 实测', lines.join('\r\n'), MARK_E].join('\r\n')
+    return [MARK_S, '# 生成时间 ' + new Date().toISOString(), '# 候选来源 GitHub520 + GitHub-IP-hosts + ineo6 + DoH(A/AAAA) + 内置，全部经本机 TLS 实测', lines.join('\r\n'), MARK_E].join('\r\n')
   }
   const doWrite = async function (list) {
-    if (DRY) return
-    writeHosts(render(list))
+    if (DRY) return { ok: true, mode: 'dry' }
+    const r = await commitHosts({ hostsPath: CFG.hosts_path, bdir: path.join(HERE, 'backups'), block: render(list), markS: MARK_S, markE: MARK_E, keep: 5 })
+    if (!r.ok) {
+      log('!! hosts 写入未成立：reason=' + r.reason + (r.error ? ' error=' + r.error : '') +
+        (r.reason === 'missing' ? '（hosts 缺失，重建需提权：repair-hosts.ps1）' : ''))
+      return r
+    }
+    if (r.mode === 'write-retry') log('写入读回首次不一致，重写后成立')
     await run('ipconfig.exe', ['/flushdns'], 8000)
+    return r
   }
+  // 落地复核：整链 + 分族；分族失败只撤该族
   const recheck = async function (list) {
     const bad = []
+    const drops = []
     for (const c of list) {
-      const v = await verify(c.dom, c.canary, [c.ip, c.ip6].filter(Boolean))
-      log((v.ok ? (v.inactive ? '未复核' : '生效  ') : '! 未生效') + c.dom.padEnd(28) + v.detail)
-      if (!v.ok) bad.push({ c, v })
+      const pins = []
+      if (c.ip) pins.push({ fam: 4, ip: c.ip })
+      if (c.ip6) pins.push({ fam: 6, ip: c.ip6 })
+      const v = await verifyDomain(c.dom, c.canary, pins)
+      log((v.sys.kind === 'ok' ? (v.sys.retried ? '生效·重试后 ' : '生效  ') : v.sys.kind === 'inactive' ? '未复核' : '! 未生效') + c.dom.padEnd(28) + v.sys.detail)
+      if (v.sys.kind === 'ok') {
+        for (const f of v.fam) {
+          if (f.kind === 'ok' || f.kind === 'inactive') continue
+          log('  ' + c.dom + ' 分族复核失败 v' + f.fam + ' ' + f.ip + '（重试后仍失败）：' + f.detail)
+          drops.push({ c: c, fam: f.fam, ip: f.ip })
+        }
+      } else if (v.sys.kind !== 'inactive') {
+        bad.push({ c: c, v: v.sys })
+      }
     }
-    return bad
+    return { bad: bad, drops: drops }
+  }
+  const applyDrops = async function (drops) {
+    if (!drops.length) return true
+    for (const d of drops) {
+      if (d.fam === 4 && d.c.ip === d.ip) d.c.ip = null
+      if (d.fam === 6 && d.c.ip6 === d.ip) d.c.ip6 = null
+    }
+    const names = drops.map(function (d) { return d.c.dom + ':v' + d.fam })
+    const w = await doWrite(chosen)
+    if (!w.ok) { log('分族撤销写入未成立（' + w.reason + '），本轮中止复核侧写回'); return false }
+    log('分族撤销 ' + drops.length + ' 条：' + names.join(', '))
+    for (const d of drops) {
+      const rd = report.domains[d.c.dom]
+      if (rd) { rd.fam_revoked = (rd.fam_revoked || []).concat(['v' + d.fam]); if (!d.c.ip && !d.c.ip6) rd.revoked = true }
+    }
+    return true
   }
   // 写入后按真实解析复核：探针可能单轮侥幸通过，落地不成立就不该留在 hosts 里
   let bad = []
+  let aborted = false
   if (DRY) {
     log('dry-run：跳过写入与落地复核（复核以真实写入为前提）')
   } else {
-    await doWrite(chosen)
-    bad = await recheck(chosen)
-    // 泄漏的常见原因是只钉了一族，另一族仍由 DNS/隧道给出并被优先选中。
-    // 先按族补钉（用实测可用的另一族候选），补不上的才撤销整域。
-    const plugged = []
-    for (const b of bad) {
-      const pl = planAfterLeak(b.c, b.v.remote)
-      if (pl.action === 'plug') { b.c[pl.key] = pl.ip; plugged.push(b.c.dom + (pl.key === 'ip6' ? ':v6' : ':v4')) }
-      else log('  ' + b.c.dom + ' 失败族已写过或无候选 -> 撤销')
-    }
-    if (plugged.length) {
-      log('补钉未覆盖族：' + plugged.join(' ') + ' -> 第二轮复核')
-      await doWrite(chosen)
-      bad = await recheck(chosen)
+    const w = await doWrite(chosen)
+    if (!w.ok) {
+      aborted = true
+      log('==== 本轮中止：hosts 未写入（' + w.reason + '），不改动任何固定 ====')
+    } else {
+      const rc1 = await recheck(chosen)
+      bad = rc1.bad
+      if (!(await applyDrops(rc1.drops))) aborted = true
+      if (!aborted) {
+        // 泄漏的常见原因是只钉了一族，另一族仍由 DNS/隧道给出并被优先选中。
+        // 先按族补钉（用实测可用的另一族候选），补不上的才撤销整域。
+        const plugged = []
+        for (const b of bad) {
+          const pl = planAfterLeak(b.c, b.v.remote)
+          if (pl.action === 'plug') { b.c[pl.key] = pl.ip; plugged.push(b.c.dom + (pl.key === 'ip6' ? ':v6' : ':v4')) }
+          else log('  ' + b.c.dom + ' 失败族已写过或无候选 -> 撤销')
+        }
+        if (plugged.length) {
+          log('补钉未覆盖族：' + plugged.join(' ') + ' -> 第二轮复核')
+          const w2 = await doWrite(chosen)
+          if (!w2.ok) { aborted = true } else {
+            const rc2 = await recheck(chosen)
+            bad = rc2.bad
+            if (!(await applyDrops(rc2.drops))) aborted = true
+          }
+        }
+      }
     }
   }
   const failed = bad.map(function (x) { return x.c.dom })
-  if (failed.length && !DRY) {
-    await doWrite(chosen.filter(function (c) { return failed.indexOf(c.dom) < 0 }))
-    log('已撤销 ' + failed.length + ' 条：' + failed.join(', '))
+  if (!aborted && failed.length && !DRY) {
+    const w3 = await doWrite(chosen.filter(function (c) { return failed.indexOf(c.dom) < 0 }))
+    if (w3.ok) log('已撤销 ' + failed.length + ' 条：' + failed.join(', '))
+    else log('撤销写入未成立（' + w3.reason + '）：' + failed.join(', '))
   }
-  for (const d of failed) if (report.domains[d]) { report.domains[d].revoked = true }
+  if (aborted) report.aborted = true
+  for (const d of failed) if (report.domains[d]) report.domains[d].revoked = true
   // T：入口体检并入同一节奏，report.json 因此同时是"这一轮所有通道的快照"
   if (DRY) log('dry-run：跳过入口体检（doctor 会写 proxy-state.json）')
   else try {
@@ -545,28 +535,7 @@ if (SELFTEST) {
     if (!ok) bad++
     console.log('  ' + (ok ? 'PASS' : 'FAIL') + '  泄漏=' + (remote || '(无响应)') + ' -> ' + JSON.stringify(got) + (ok ? '' : '，期望 ' + JSON.stringify(want)))
   }
-  // fake-ip 判定：命中代理内核的假地址段时复核必须让路，否则写好的固定会被误撤销
-  const fakeCases = [
-    ['198.18.0.30', true], ['198.18.255.255', true], ['198.19.0.1', false], ['20.205.243.166', false],
-    ['fdfe:dcba:9876::1', true], ['fdfe:dcba:9877::1', false], ['2606:4700::6811:6fb8', false], ['', false]
-  ]
-  for (const [ip, want] of fakeCases) {
-    const ok = isFakeIp(ip) === want
-    if (!ok) bad++
-    console.log('  ' + (ok ? 'PASS' : 'FAIL') + '  isFakeIp(' + (ip || '(空)') + ') = ' + isFakeIp(ip) + (ok ? '' : '，期望 ' + want))
-  }
-  // 公网域名解到回环/内网同样不能当泄漏证据（交互式 shell 的 http_proxy 会让 curl 连到 127.0.0.1）
-  const localCases = [
-    ['127.0.0.1', true], ['192.168.0.1', true], ['10.1.2.3', true], ['172.16.0.1', true], ['172.32.0.1', false],
-    ['20.205.243.166', false], ['fe80::1', true], ['fc00::1', true], ['2606:4700::6811:6fb8', false]
-  ]
-  for (const [ip, want] of localCases) {
-    const ok = isLocalIp(ip) === want
-    if (!ok) bad++
-    console.log('  ' + (ok ? 'PASS' : 'FAIL') + '  isLocalIp(' + ip + ') = ' + isLocalIp(ip) + (ok ? '' : '，期望 ' + want))
-  }
-  // 落地复核的响应码口径（2026-10-13 修）：code=000（TCP 连上但请求挂死/超时）不算落地；
-  // objects 根路径正常就回 404，不能被误判成失败
+  // 落地复核的响应码口径：code=000（TCP 连上但请求挂死/超时）不算落地；objects 根路径正常就回 404
   const codeCases = [
     ['github.com', 0, false], ['github.com', 200, true], ['github.com', 404, false],
     ['objects.githubusercontent.com', 404, true], ['objects.githubusercontent.com', 0, false],
@@ -578,16 +547,15 @@ if (SELFTEST) {
     if (!ok) bad++
     console.log('  ' + (ok ? 'PASS' : 'FAIL') + '  落地码 ' + dom + ' code=' + code + ' -> ' + got + (ok ? '' : '，期望 ' + want))
   }
-  // v6 形式校验（2026-10-13 修）：池子/hosts 里读到三冒号垃圾不能再当有效 v6
-  const formCases = [
-    ['2606:50c0:8000::153', 6], ['2a04:4e42:200::485', 6], ['20.205.243.166', 4],
-    ['2606:50c0:8000:::1', 0], ['2606:50c0::::1', 0], ['a::b::c', 0], ['', 0]
+  // 模块接线自检：ip.mjs 的严格校验确实被本进程用上（垃圾形式一律为 0）
+  const wireCases = [
+    ['2606:50c0:8000::153', 6], ['104.17.208.5', 4], ['2606:50c0:8000:::1', 0], ['', 0]
   ]
-  for (const [ip, want] of formCases) {
+  for (const [ip, want] of wireCases) {
     const got = fam(ip)
     const ok = got === want
     if (!ok) bad++
-    console.log('  ' + (ok ? 'PASS' : 'FAIL') + '  fam(' + (ip || '(空)') + ') = ' + got + (ok ? '' : '，期望 ' + want))
+    console.log('  ' + (ok ? 'PASS' : 'FAIL') + '  接线 fam(' + (ip || '(空)') + ') = ' + got + (ok ? '' : '，期望 ' + want))
   }
   // 跨族选择：无 AAAA 时不能因为"v4 慢"就把比 v4 还慢的 v6 写进去
   // （线上真实踩过：cdn.jsdelivr.net 的 v4 1012ms 被 v6 1948ms 顶掉）
@@ -610,7 +578,7 @@ if (SELFTEST) {
     console.log('  ' + (ok ? 'PASS' : 'FAIL') + '  ' + name + ' -> take4=' + !!got.take4 + ' take6=' + !!got.take6 +
       (ok ? '' : '，期望 take4=' + want4 + ' take6=' + want6))
   }
-  const total = cases.length + fakeCases.length + localCases.length + codeCases.length + formCases.length + pinCases.length
+  const total = cases.length + codeCases.length + wireCases.length + pinCases.length
   console.log(bad ? '  自测失败 ' + bad + ' 项' : '  自测 ' + total + '/' + total + ' 通过')
   process.exit(bad ? 1 : 0)
 }

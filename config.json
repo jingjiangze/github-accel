@@ -6,7 +6,8 @@
     "https://cdn.jsdelivr.net/gh/521xueweihan/GitHub520@main/hosts",
     "https://raw.githubusercontent.com/521xueweihan/GitHub520/main/hosts",
     "https://cdn.jsdelivr.net/gh/ittuann/GitHub-IP-hosts@main/hosts",
-    "https://raw.githubusercontent.com/ittuann/GitHub-IP-hosts/main/hosts"
+    "https://raw.githubusercontent.com/ittuann/GitHub-IP-hosts/main/hosts",
+    "https://gitlab.com/ineo6/hosts/-/raw/master/hosts"
   ],
   "discovery": {
     "enabled": true,
@@ -42,6 +43,7 @@
     "concurrency": 8,
     "win_ratio": 0.85,
     "retries": 3,
+    "verify_retries": 1,
     "max_entries": 30,
     "ok_codes": [200, 206, 301, 302, 404],
     "min_bytes": 1
@@ -56,6 +58,7 @@
   "proxy_explore_every": 6,
   "pool": {
     "enabled": true,
+    "state_max_age_days": 45,
     "probe_per_round": 8,
     "explore_ratio": 0.15,
     "min_samples": 2,
@@ -99,7 +102,7 @@
     "registry.npmjs.org": { "canary": "/react" }
   },
   "static_ips": {
-    "github.com": ["20.205.243.166", "20.205.243.165", "140.82.112.4", "140.82.113.4", "140.82.114.4", "140.82.116.4", "20.29.134.23"],
+    "github.com": ["20.205.243.165", "140.82.112.4", "140.82.113.4", "140.82.114.4", "140.82.116.4", "20.29.134.23"],
     "codeload.github.com": ["20.205.243.165", "20.29.134.24"],
     "api.github.com": ["20.29.134.17", "140.82.116.6"],
     "objects.githubusercontent.com": ["185.199.108.133", "185.199.109.133", "185.199.110.133", "185.199.111.133"],

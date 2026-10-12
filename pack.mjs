@@ -36,6 +36,9 @@ const RUNTIME_FILES = [
   'LICENSE',
   'README.md',
   'accel.mjs',          // A 层：自适应 hosts
+  'ip.mjs',             // A 层模块：IP 形式校验/分类（net.isIP 严格）
+  'probe.mjs',          // A 层模块：探测/复核判定（纯函数）
+  'hostsio.mjs',        // A 层模块：hosts 安全提交（备份+直写+读回）
   'gh.mjs',             // B 层：反代入口竞速取件
   'manifest.mjs',       // 反代入口体检 -> 清单
   'discover.mjs',       // 候选发现
@@ -43,6 +46,7 @@ const RUNTIME_FILES = [
   'config.json',
   'manifest-seed.json',
   'install-task.ps1',   // 本机计划任务
+  'repair-hosts.ps1',   // 应急修复：hosts 缺失时从最近备份恢复（提权）
   'run-hidden.vbs',
   'box/run-probe.ps1',  // 盒子侧常驻测速
   'box/install-task.ps1',

@@ -2,19 +2,23 @@
 
 面向 Windows（Git Bash / PowerShell 皆可）。两层互补，各自解决实测确认不同的故障面：
 
-> **关于权限**：写 `C:\Windows\System32\drivers\etc\hosts` 在标准 Windows 上**需要管理员权限**。
-> 本机之所以能免提权，是因为给 hosts **文件**单独授过写权限（`icacls` 显示 `Everyone:(F)`），
-> 它所在的目录仍然不可写。`install-task.ps1` 现在会先探测可写性：不可写且当前不是管理员时**直接报错**
-> 并给出授权命令，不会静默装出一个"跑得正常、但加速从未生效"的任务。
-> 另：`Everyone:(F)` 偏宽（本机任何账户都能改 hosts），更窄的写法是只授当前用户：
-> `icacls "C:\Windows\System32\drivers\etc\hosts" /grant "%USERNAME%:(M)"`。
+> **关于权限（2026-10-13 实测更新）**：写 `C:\Windows\System32\drivers\etc\hosts` 的**内容是可行的**——
+> 前提是 hosts 文件上有一条本用户的显式 ACE（本机现状：`jingjiang:(M)`，另有目录继承的 SYSTEM/Administrators 项）。
+> `drivers\etc\` **目录本身不可写**（用户在该目录无法创建/删除文件），所以"临时文件 + 原子 rename"的记录方式在这台机器上
+> **全部不可用**（实测：同目录建临时文件 EACCES；跨目录 rename 到 hosts EPERM；.NET `File.Replace` 失败时会把目标移走，
+> **已永久禁用**）。现行写入策略：**写前备份 → 直接写 → 写后逐字节读回**（读回不符会重写一次，仍不符则从备份恢复并中止本轮）。
+> 如果 hosts 文件**整个缺失**（重建需要提权），工具会拒绝继续并提示运行 `repair-hosts.ps1`
+> （自动静默提权，从 `backups/` 最近一份恢复；本机 `ConsentPromptBehaviorAdmin=0` 实测可用）。
+> `install-task.ps1` 会先探测可写性：不可写且当前不是管理员时**直接报错**，不会静默装出一个"跑得正常、但加速从未生效"的任务。
 
 | 层 | 文件 | 解决什么 |
 |---|---|---|
-| A 自适应 hosts | `accel.mjs` | 头像、raw、归档包、npm/jsDelivr 等**能靠 IP 救**的通道：候选 IP 逐条本机 TLS 实测，只有确实更快才写入 |
+| A 自适应 hosts | `accel.mjs`（+ `ip` / `probe` / `hostsio` 三个模块） | 头像、raw、归档包、npm/jsDelivr 等**能靠 IP 救**的通道：候选 IP 逐条本机 TLS 实测，只有确实更快才写入 |
 | B 竞速取件 | `gh.mjs` | `github.com` 首跳、release 下载、`git clone` 这类**换 IP 无效**的通道：每次请求同时压多个入口，先出数据的胜出，停滞带 Range 换源续传 |
 
 设计取向是**宁可不写，也不写坏**：写错的 hosts 条目比不写更糟（浏览器全站受影响），所以每条固定都要过"多轮实测 + 写入后真实解析复核"。复核若发现真实解析落到了**没钉的那一族**，先按族补钉（用另一族实测可用的候选）再复核第二轮，补不上才整域撤销。该判定（`planAfterLeak`）可用 `node accel.mjs --selftest` 离线回归。
+
+v2（2026-10-13）把这套守护做细了：落地复核 = **系统解析整链检查 + 每族 `--resolve` 直检**，任一项失败先重试 1 次再判决；某一族直检失败只撤那一族（旧版只能整域撤）。判定拆进三个可离线回归的模块：`ip.mjs`（`net.isIP` 严格校验 + v6 前缀归一）、`probe.mjs`（解析/判定纯函数）、`hostsio.mjs`（备份+直写+读回的安全提交）。
 
 ## 快速开始
 
@@ -36,6 +40,9 @@ node gh.mjs clone --depth 1 https://github.com/octocat/Hello-World.git
 
 :: 离线自测（不联网、不落盘）
 node accel.mjs --selftest
+node ip.mjs --selftest
+node probe.mjs --selftest
+node hostsio.mjs --selftest
 node gh.mjs --selftest
 node pool.mjs --selftest
 node discover.mjs --selftest
@@ -45,7 +52,21 @@ node relay/test/middleware.test.mjs
 :: 回滚
 node accel.mjs --revert
 schtasks /delete /tn QoderAccel /f
+
+:: 应急修复（hosts 文件缺失或损坏时；自动提权从最近备份恢复）
+powershell -NoProfile -ExecutionPolicy Bypass -File repair-hosts.ps1
 ```
+
+## v2 重写要点（2026-10-13）
+
+依据当日完整审计与一次真实事故的教训（细节见仓库提交记录）：
+
+- **写入安全**：只能"直写"（见上"关于权限"）；安全来自流程——写前备份、写后读回、失败自恢复、缺失守卫。
+- **复核增强**：整链 + 分族两层；失败重试 1 次再判决；分族失败只撤该族。
+- **形式校验收口**：所有 IP 入口走 `ip.mjs`（`net.isIP` 严格；v6 前缀按规范化 /64 归组）。
+- **状态治理**：`pool-state.json` 按"45 天未被观测"裁剪（`pool.state_max_age_days`），防无限膨胀。
+- **候选源**：新增 ineo6/hosts（GitLab 活跃源）为第三提示源；`/meta` 限流时用 `meta-cache.json` 上次成功结果兜底（TTL 7 天）。
+- **回退**：`node accel.mjs --revert`（移除标记块）；应急 `repair-hosts.ps1`（缺失恢复）；代码层面 `git revert`。
 
 ## 发行包（只含运行文件）
 
@@ -58,9 +79,9 @@ schtasks /delete /tn QoderAccel /f
 包内容 = `pack.mjs` 里的**白名单**，逐个列文件、缺一个就让 CI 红掉。为什么不用黑名单：
 「只含运行文件」用黑名单迟早会漏——这个仓库就漏过 `manifest-cache.json`。
 
-| 进包（16 个） | 不进包 |
+| 进包（20 个） | 不进包 |
 |---|---|
-| `accel.mjs`、`gh.mjs`、`manifest.mjs`、`discover.mjs`、`pool.mjs`、`config.json`、`manifest-seed.json`、`install-task.ps1`、`run-hidden.vbs`、`box/run-probe.ps1`、`box/install-task.ps1`、`relay/`（`wrangler.toml` + `functions/` + `public/`）、`README.md`、`LICENSE` | `.github/`（CI）、`.gitignore`、`relay/test/`（测试），以及所有运行期产物（`logs/`、`backups/`、`report.json`、`proxy-state.json`、`candidates.json`、`pool-state.json`、`manifest-cache.json`、`dist/`、`run.lock`、`relay-key`） |
+| `accel.mjs`、`ip.mjs`、`probe.mjs`、`hostsio.mjs`、`gh.mjs`、`manifest.mjs`、`discover.mjs`、`pool.mjs`、`config.json`、`manifest-seed.json`、`install-task.ps1`、`repair-hosts.ps1`、`run-hidden.vbs`、`box/run-probe.ps1`、`box/install-task.ps1`、`relay/`（`wrangler.toml` + `functions/` + `public/`）、`README.md`、`LICENSE` | `.github/`（CI）、`.gitignore`、`relay/test/`（测试），以及所有运行期产物（`logs/`、`backups/`、`report.json`、`proxy-state.json`、`candidates.json`、`pool-state.json`、`manifest-cache.json`、`meta-cache.json`、`dist/`、`run.lock`、`relay-key`） |
 
 ```bat
 node pack.mjs --selftest                  :: CRC32 标准向量 + ZIP 读写往返 + 白名单断言（不联网）

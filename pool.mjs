@@ -11,26 +11,14 @@
 import fs from 'node:fs'
 import path from 'node:path'
 import { fileURLToPath } from 'node:url'
+import { fam, prefixOf } from './ip.mjs'
 
 const HERE = path.dirname(fileURLToPath(import.meta.url))
 const STATE = path.join(HERE, 'pool-state.json')
 const CANDS = path.join(HERE, 'candidates.json')
 
-function isV4(s) { return /^\d{1,3}(\.\d{1,3}){3}$/.test(String(s || '').trim()) }
-// 形式收严（2026-10-13）：与 discover/accel 同步，拒三冒号等非法形式
-// （池子里曾有 "2606:50c0:8000:::1" 这类垃圾，宽松正则会把它当有效 v6 参与择优）
-function isV6(s) {
-  const t = String(s || '').trim()
-  return t.indexOf(':') >= 0 && /^[0-9a-fA-F:]+$/.test(t) && t.indexOf(':::') < 0 && t.split('::').length <= 2
-}
-function fam(ip) { return isV4(ip) ? 4 : (isV6(ip) ? 6 : 0) }
+// 形式校验 / 前缀归一 统一走 ip.mjs（net.isIP 严格，兼容 v6 等价写法归一）；同 /24（v4）或 /64（v6）算一个故障域
 function key(dom, ip) { return dom + '|' + ip }
-// 同一 /24（v4）或 /64（v6）当作一个故障域，避免一撮候选全落在同一个前缀里
-function prefixOf(ip) {
-  if (isV4(ip)) return ip.split('.').slice(0, 3).join('.')
-  const seg = String(ip).split(':').filter(Boolean)
-  return seg.slice(0, 4).join(':')
-}
 function pct(arr, p) {
   if (!arr || !arr.length) return 0
   const a = arr.slice().sort(function (x, y) { return x - y })
@@ -45,6 +33,20 @@ function cooldownFor(streak, now, C) {
   if (streak >= (C.tier2_fails || 5)) return now + (C.tier2_ms || 2 * 3600e3)
   if (streak >= (C.tier1_fails || 3)) return now + (C.tier1_ms || 30 * 60e3)
   return 0
+}
+
+// 状态治理（2026-10-13 v2 新增）：太久没被观测的条目清掉，防 pool-state.json 无限膨胀。
+// 判据 = last_at/last_ok 均过期的条目；被裁剪的候选若再次出现在候选里，会以"新探索"身份重新入库。
+export function pruneState(st, now, cfg) {
+  const P = (cfg && cfg.pool) || {}
+  const maxAge = (P.state_max_age_days || 45) * 86400e3
+  let removed = 0
+  for (const k of Object.keys(st.entries || {})) {
+    const e = st.entries[k]
+    const last = (e && (e.last_at || e.last_ok)) || 0
+    if (now - last > maxAge) { delete st.entries[k]; removed++ }
+  }
+  return removed
 }
 
 export function mergeObs(prev, obs, now, cfg) {
@@ -170,14 +172,16 @@ export function loadCandidates() {
   try { return JSON.parse(fs.readFileSync(CANDS, 'utf8')) } catch (e) { return null }
 }
 
-// 给 accel 用的便捷封装：读盘 -> 选探针 -> 记录 -> 落盘
+// 给 accel 用的便捷封装：读盘 -> 裁剪 -> 选探针 -> 记录 -> 落盘
 export function open(cfg) {
   const st = loadState()
+  const pruned = pruneState(st, Date.now(), cfg)
   const cands = loadCandidates()
   if (!st.entries) st.entries = {}
   const on = !!(cfg.pool && cfg.pool.enabled) && !!cands
   return {
     on: on,
+    pruned: pruned,
     candidatesAt: cands ? cands.at : 0,
     probes: function (dom, n, rand) {
       const list = (cands && cands.domains && cands.domains[dom]) || []
@@ -263,6 +267,14 @@ if (isMain) {
     const bk = buckets(Object.assign({}, entries, cold), CFG)
     T('冷却进 quarantine', bk.quarantine.length, 1)
     T('高可用进 active', bk.active.some(function (x) { return x.ip === '1.1.1.1' }), true)
+    // 状态治理（2026-10-13 v2）：45 天未见条目被裁剪，新条目保留
+    const st2 = { v: 1, entries: {
+      'a|1.1.1.1': { dom: 'a', ip: '1.1.1.1', last_at: now },
+      'b|2.2.2.2': { dom: 'b', ip: '2.2.2.2', last_at: now - 46 * 86400e3 }
+    } }
+    const pruned = pruneState(st2, now, CFG)
+    T('过期条目被裁剪', [pruned, !!st2.entries['a|1.1.1.1'], !!st2.entries['b|2.2.2.2']], [1, true, false])
+    T('无时间戳条目算过期', pruneState({ entries: { 'c|3.3.3.3': { dom: 'c', ip: '3.3.3.3' } } }, now, CFG), 1)
     console.log(bad ? '  自测失败 ' + bad + ' 项' : '  自测全部通过')
     process.exit(bad ? 1 : 0)
   }
