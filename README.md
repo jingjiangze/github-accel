@@ -223,10 +223,11 @@ node pool.mjs show github.com     :: 只看某个域
   对 `manifest-seed.json`（人工维护的「待测集合」）∪ `config.json` 的 `proxies` / `proxies_explore` 逐个做
   **内容级体检**（必须取回约定 canary 内容）+ **带宽样本**（真拉够一段数据），结果写成 `proxies.json`，
   发布到 `manifest` 分支（单提交 + force-push，天然滚动更新，不留历史）。
-- 本机 `gh.mjs` 按 `config.json` 的 `manifest` 段取这份清单（先 raw、再 jsDelivr，全失败退回本地缓存），
 - 本机 `gh.mjs` 按 `config.json` 的 `manifest` 段取这份清单（先 jsDelivr 镜像、再 raw 兜底，全失败退回本地缓存），
-  把 `ok=true` 的入口并进候选池、标成 `[清]`，**和候选池一样只做低频测量、不参与竞速**——
-  runner 的速度数字对本机线路没有参考价值，排名仍由本机实测决定（见「为什么是竞速而不是选最快的入口」）。
+  把 `ok=true` 的入口并进候选池、标成 `[清]`。这些入口**每轮都会在本机实测**（内容级 + 带宽样本），
+  开着 `manifest.race`（默认开）就**参与三路竞速**——竞速排名用的是本机这次实测的数字，
+  runner 的远程速度数字从不参与；关掉 `manifest.race` 则退回「只低频测量、不参与竞速」。
+  候选池（`proxies_explore`）因为样本可能是一小时前的，仍不参与竞速（见下方）。
 
 判定与 `gh.mjs doctor` 同源：`ok` = 取回约定内容 **且** 大文件样本过了 `bulk_min_bytes` / `bulk_min_bps`。
 只回 200 没有约定内容的拦截页、或只回几百字节错误页的，都进不了 `live`。
@@ -313,7 +314,9 @@ token 打 `repository_dispatch`（`type=manifest`），不要指望 GitHub 的 c
 - `deny`：永不固定的域名。
 - `proxies`：主入口清单，每轮体检都会测。`gh.mjs doctor --force` 重新体检。
 - `proxies_explore`：候选池，只做**低频测量、不参与竞速**（它的样本可能是一小时前的，拿它选路等于用陈旧数据）。`proxy_explore_every` 控制节奏（默认 6 轮 ≈ 1 小时）；`doctor --explore` 可强制探一次，测出可用的会点名提示你加进 `proxies`。
-- `manifest`：反代入口的**动态清单**（Actions 在中立出口体检出的 live 入口，本机当候选池消费，标 `[清]`）。见下文专节。
+- `manifest`：反代入口的**动态清单**（Actions 在中立出口体检出的 live 入口，本机每轮再实测一遍，标 `[清]`）。见下文专节。
+  - `manifest.race`（默认 `true`）：开时 `[清]` 入口**参与三路竞速**（用本机这次实测排名）；关则退回只测不参与竞速。
+  - `manifest.ttl_h` / `cache` / `max_entries` / `only_ok` / `urls`：取源与缓存策略。
 - `proxy_ttl_s`：入口体检缓存（默认 60 秒）。
 - `proxy_probe_concurrency`：入口体检并发数（默认 4）。
 - `proxy_history_samples`：每个入口保留多少轮历史样本，用于算稳定性/分位数。

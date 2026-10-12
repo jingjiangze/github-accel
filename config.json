@@ -152,7 +152,8 @@
     "ttl_h": 6,
     "cache": "manifest-cache.json",
     "max_entries": 24,
-    "only_ok": true
+    "only_ok": true,
+    "race": true
   },
   "relay": {
     "enabled": true,

@@ -101,14 +101,18 @@ function entryDefs(includeExplore, manifestU) {
   const list = (CFG.proxies || []).map(function (p) { return { key: p, prefix: p, tier: 'core' } })
   const rp = relayReal()
   if (rp) list.unshift({ key: RELAY_ALIAS, prefix: rp, tier: 'core' })
-  // 候选池只做低频测量，不参与竞速：它的样本可能是一小时前的，拿它选路等于用陈旧数据
+  const seen = new Set(list.map(function (e) { return e.key }))
+  // 候选池（proxies_explore）始终进入 seen：即便非 explore 轮不测量它，也要防止它在动态清单里
+  // 被误标成 manifest 层而穿插进竞速。优先级 core > explore > manifest。
+  for (const p of (CFG.proxies_explore || [])) seen.add(p)
   if (includeExplore) {
-    const seen = new Set(list.map(function (e) { return e.key }))
-    for (const p of (CFG.proxies_explore || [])) if (!seen.has(p)) { seen.add(p); list.push({ key: p, prefix: p, tier: 'explore' }) }
-    // 动态清单（Actions 在中立出口判过"还活着"的入口）：并进候选池，本机再实测一遍。
-    // 同样只做候选、不参与竞速，也不改主清单——改 config 的 proxies 属于用户的决定。
-    for (const p of (manifestU || [])) if (!seen.has(p)) { seen.add(p); list.push({ key: p, prefix: p, tier: 'manifest' }) }
+    for (const p of (CFG.proxies_explore || [])) if (!seen.has(p)) list.push({ key: p, prefix: p, tier: 'explore' })
   }
+  // 动态清单（Actions 在中立出口判过"还活着"的入口）：每次体检都本机实测一遍，
+  // 因为它要参与竞速（manifest.race 开时），必须用本机这次的实测数字排名，不能拿一小时前的样本。
+  // 探测量很小（默认 24 以内）且只做内容级+带宽样本，开销可接受。
+  // 只收「清单独有、不在主/候选池」的入口。
+  for (const p of (manifestU || [])) if (!seen.has(p)) { seen.add(p); list.push({ key: p, prefix: p, tier: 'manifest' }) }
   return list
 }
 
@@ -355,8 +359,12 @@ function order(st) {
 // strict=true 只认过了带宽门槛的；带宽门槛全灭时退化为"仅内容标记可用"，别让竞速直接无入口
 function pickRacers(st, n, strict) {
   const now = Date.now()
-  // 只有主清单（core）能进竞速：候选池（explore）与动态清单（manifest）都只做低频测量
-  const ok = order(st).filter(function (e) { return (strict === false ? (e.ok || e.soft) : e.ok) && (e.tier || 'core') === 'core' })
+  // 默认只有主清单（core）能进竞速。动态清单（manifest）的入口现已每轮在本地实测
+  // （checkAll 里并入体检，有真实 ok/bps/score），所以开启 manifest.race 时允许它参与竞速——
+  // 仍是在「本机实测」上竞争，runner 的远程速度数字从不参与排名，符合「竞速而非选最快入口」的设计。
+  // 候选池（explore）不进竞速：它的样本可能是一小时前的，拿它选路等于用陈旧数据。
+  const racing = (CFG.manifest && CFG.manifest.race) ? ['core', 'manifest'] : ['core']
+  const ok = order(st).filter(function (e) { return (strict === false ? (e.ok || e.soft) : e.ok) && racing.indexOf(e.tier || 'core') >= 0 })
   const usable = ok.filter(function (e) { return !inCooldown(e, now) })
   const base = usable.length ? usable : ok
   if (!CFG.proxy_race_diversity) return base.slice(0, n)
@@ -537,9 +545,10 @@ async function doctor(show, explore) {
     '  实测 ' + mbps(e.bps || 0).padStart(6) + ' MB/s  评分 ' + String(e.score || 0).padStart(5) +
     ' code=' + e.code + '/' + e.bulk_code + ' 样本=' + (e.bulk_bytes || 0) +
     (inCooldown(e, now) ? '  [冷却中]' : ''))
-  // 候选池（含动态清单）里翻身的入口不会自动进主清单（改 config 属于用户的决定），这里点名提示
+  // 候选池（proxies_explore）里翻身的入口不会自动进主清单或竞速（改 config 属于用户的决定），这里点名提示。
+  // 动态清单（manifest）的入口已随 manifest.race 自动参与竞速，不再需要手动晋升。
   if (st.explore) {
-    const promoted = order(st).filter(function (e) { return (e.tier === 'explore' || e.tier === 'manifest') && e.ok })
+    const promoted = order(st).filter(function (e) { return e.tier === 'explore' && e.ok })
     console.log(promoted.length
       ? '  候选池本轮可用：' + promoted.map(function (e) { return maskPrefix(e.prefix) + '（' + mbps(e.bps || 0) + ' MB/s）' }).join('、') +
         '  —— 想启用请加进 config.json 的 proxies'
@@ -638,7 +647,8 @@ if (SELFTEST) {
   // 动态清单：并进候选池（tier=manifest）、与主清单去重、同样不参与竞速
   T('清单入口标成 manifest 层', entryDefs(true, ['https://mf.test/']).filter(function (e) { return e.prefix === 'https://mf.test/' })[0].tier, 'manifest')
   T('清单与主清单去重', entryDefs(true, ['https://gh-proxy.com/']).filter(function (e) { return e.prefix === 'https://gh-proxy.com/' }).length, 1)
-  T('不探候选池时不带清单入口', entryDefs(false, ['https://mf.test/']).some(function (e) { return e.tier === 'manifest' }), false)
+  T('不探候选池时仍并入动态清单（每轮本机实测，供竞速）', entryDefs(false, ['https://mf.test/']).some(function (e) { return e.tier === 'manifest' }), true)
+  T('不探候选池时不带候选池入口', entryDefs(false, ['https://mf.test/']).some(function (e) { return e.tier === 'explore' }), false)
   T('清单默认只取 ok 的', manifestEntries({ entries: [{ url: 'https://a/', ok: true }, { url: 'https://b/', ok: false }] }), ['https://a/'])
   T('清单兼容只有 live 数组', manifestEntries({ live: ['https://c/'] }), ['https://c/'])
   T('清单数量有上限', manifestEntries({ entries: Array.from({ length: 100 }, function (_, i) { return { url: 'https://x' + i + '/', ok: true } }) }).length, (CFG.manifest && CFG.manifest.max_entries) || 24)
@@ -648,7 +658,14 @@ if (SELFTEST) {
     { prefix: 'https://mf2/', ok: true, bps: 9999, ms: 5, tier: 'manifest', hist: { samples: 3, ok_count: 3, fail_streak: 0, speeds: [9999], lats: [5] } }
   ] }
   const pm = pickRacers(stm, 3)
-  T('清单入口不参与竞速', pm.length === 1 && pm[0].prefix === 'https://core2/', true)
+  T('清单入口随 manifest.race 进竞速', pm.some(function (e) { return e.prefix === 'https://mf2/' }), !!(CFG.manifest && CFG.manifest.race))
+  T('manifest.race 关时清单不竞速', (function () {
+    const saved = CFG.manifest && CFG.manifest.race
+    if (CFG.manifest) CFG.manifest.race = false
+    const p0 = pickRacers(stm, 3)
+    if (CFG.manifest) CFG.manifest.race = saved
+    return p0.length === 1 && p0[0].prefix === 'https://core2/'
+  })(), true)
   // 多观测点合并：盒子（真实线路）在前，与 runner 的并集去重
   const mm = mergeManifests([
     { url: 'https://raw/manifest-box/proxies.json', mf: { generated_at: '2026-10-10T12:00:00Z', runner: { vantage: 'box-shandong' }, entries: [{ url: 'https://a/', ok: true }] } },
