@@ -18,7 +18,9 @@ const SELFTEST = ARGV.includes('--selftest')
 
 function run(exe, args, timeoutMs) {
   return new Promise(function (resolve) {
-    execFile(exe, args, { maxBuffer: 64 * 1024 * 1024, windowsHide: true, timeout: timeoutMs || 60000, encoding: 'utf8' },
+    // maxBuffer 8MB（2026-10-13 从 64MB 收紧）：内容级体检要在内存里读响应体找标记（不能设太小否则会截断体检），
+    // 8MB 对"哨兵响应 + 带宽样本的尾巴"有足够余量，同时消除 64MB 的失控面。
+    execFile(exe, args, { maxBuffer: 8 * 1024 * 1024, windowsHide: true, timeout: timeoutMs || 60000, encoding: 'utf8' },
       function (err, out, errout) {
         resolve({ code: err ? (typeof err.code === 'number' ? err.code : 1) : 0, stdout: (out || '').trim(), stderr: (errout || '').trim() })
       })

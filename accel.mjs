@@ -66,7 +66,10 @@ function releaseLock() { try { fs.unlinkSync(LOCK) } catch (e) {} }
 
 function run(exe, args, timeoutMs) {
   return new Promise(function (resolve) {
-    execFile(exe, args, { maxBuffer: 32 * 1024 * 1024, windowsHide: true, timeout: timeoutMs || 25000, encoding: 'utf8' },
+    // maxBuffer 1MB（2026-10-13 收紧）：所有调用都 -o NUL 只留 -w 尾巴，实际输出永远 <1KB；
+  // 实测 32MB→1MB 峰值仅差 0.3MB（Node 不预分配），所以这不是省内存，而是消除
+  // "某条 curl 输出失控就吃掉 32MB" 的失控面。
+  execFile(exe, args, { maxBuffer: 1024 * 1024, windowsHide: true, timeout: timeoutMs || 25000, encoding: 'utf8' },
       function (err, out, errout) {
         resolve({ code: err ? (typeof err.code === 'number' ? err.code : 1) : 0, stdout: (out || '').trim(), stderr: (errout || '').trim() })
       })

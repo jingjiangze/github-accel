@@ -23,7 +23,9 @@ const D = CFG.discovery || {}
 function log() { console.log(Array.from(arguments).join(' ')) }
 function run(exe, args, timeoutMs) {
   return new Promise(function (resolve) {
-    execFile(exe, args, { maxBuffer: 64 * 1024 * 1024, windowsHide: true, timeout: timeoutMs, encoding: 'utf8' },
+    // maxBuffer 1MB（2026-10-13 收紧）：源响应体最大几百 KB（hosts 列表 / JSON 段列表），
+    // 收紧是为防失控（Node 不预分配，实测对峰值影响可忽略）
+    execFile(exe, args, { maxBuffer: 1024 * 1024, windowsHide: true, timeout: timeoutMs, encoding: 'utf8' },
       function (err, out) { resolve({ code: err ? 1 : 0, stdout: out || '' }) })
   })
 }
