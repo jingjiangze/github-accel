@@ -12,6 +12,8 @@ import { fileURLToPath } from 'node:url'
 const HERE = path.dirname(fileURLToPath(import.meta.url))
 const CFG = JSON.parse(fs.readFileSync(path.join(HERE, 'config.json'), 'utf8'))
 const OUT = path.join(HERE, 'candidates.json')
+const META_CACHE = path.join(HERE, 'meta-cache.json')
+const META_CACHE_MAX_H = 168
 const ARGV = process.argv.slice(2)
 const FORCE = ARGV.includes('--force')
 const VERBOSE = ARGV.includes('-v')
@@ -33,7 +35,12 @@ function num4(ip) {
 }
 function str4(n) { return [(n >>> 24) & 255, (n >>> 16) & 255, (n >>> 8) & 255, n & 255].join('.') }
 function isV4(s) { return /^\d{1,3}(\.\d{1,3}){3}$/.test(String(s).trim()) }
-function isV6(s) { const t = String(s).trim(); return t.indexOf(':') >= 0 && /^[0-9a-fA-F:]+$/.test(t) }
+// 形式收严（2026-10-13）：宽松正则配拼串曾产出 "2606:50c0:8000:::1" 这类三冒号垃圾并混进候选池；
+// 这里显式挡掉（只做形式校验，不做逐组范围校验）
+function isV6(s) {
+  const t = String(s).trim()
+  return t.indexOf(':') >= 0 && /^[0-9a-fA-F:]+$/.test(t) && t.indexOf(':::') < 0 && t.split('::').length <= 2
+}
 
 // 每个 /24 抽 per24 个，而不是把整个网段扫完（CloudflareSpeedTest 就是这么控成本的）
 function sampleCidr4(cidr, per24, rand) {
@@ -57,16 +64,23 @@ function sampleCidr4(cidr, per24, rand) {
   return out
 }
 // v6 网段太大，只按 /64 取网络地址（够用来当候选探针，不做全扫）
+// 2026-10-13 修：旧版对带 :: 的地址做 split(':').slice(0,4).join(':')，空组原样参与拼接，
+// 产出 "2606:50c0:8000:::1"（三冒号）这类非法地址——GitHub /meta 的 pages 恰恰全是
+// "2606:50c0:8000::153/128" 单地址，整批被拼坏，objects 因此一直没有可用 v6 候选。
 function sampleCidr6(cidr, per64) {
   const parts = String(cidr).trim().split('/')
   if (!isV6(parts[0])) return []
   const bits = parts[1] === undefined ? 128 : Number(parts[1])
-  const head = parts[0].toLowerCase().split(':')
+  // /128 就是一个地址：原样返回
+  if (bits >= 128) return [parts[0].toLowerCase()]
+  // 先把 :: 展开收成合法 4 组前缀再拼，避免拼出 "::::1"
+  const head = parts[0].toLowerCase().split(':').filter(function (x) { return x !== '' }).slice(0, 4)
+  while (head.length < 4) head.push('0')
+  const prefix = head.join(':')
   const out = []
   const groups = Math.max(1, Math.min(4, Math.pow(2, Math.max(0, 64 - bits))))
   for (let g = 0; g < groups; g++) {
-    const seg = head.slice(0, 4)
-    out.push(seg.join(':') + '::' + (g + 1).toString(16))
+    out.push(prefix + '::' + (g + 1).toString(16))
   }
   return out.slice(0, per64 || 1)
 }
@@ -103,6 +117,9 @@ function parseThirdParty(text) {
   return map
 }
 function fam(ip) { return isV4(ip) ? 4 : (isV6(ip) ? 6 : 0) }
+function readMetaCache() {
+  try { return JSON.parse(fs.readFileSync(META_CACHE, 'utf8')) } catch (e) { return null }
+}
 function dedupe(list) {
   const seen = new Set(), out = []
   for (const x of list) if (x && !seen.has(x)) { seen.add(x); out.push(x) }
@@ -155,12 +172,29 @@ async function main() {
   sources.doh_domains = Object.keys(CFG.domains || {}).length
 
   // 2) GitHub /meta（按服务映射到本项目的域）
+  //    2026-10-13 补：/meta 走未认证 API，会被 60 次/时/IP 的限流打掉（403 的错误 JSON 解析出来是
+  //    空对象，旧代码把这种当"已解析 0 个服务"直接空手而归）——而 pages 段的 v6 单地址
+  //    （2606:50c0:8000::153/128）是 objects/raw/avatars/githubassets 唯一的 v6 来源，
+  //    掉一次 objects 整族就没有 v6 候选。兜底：成功时落 meta-cache.json，失败用上次成功结果（TTL 7 天）。
   if (D.github_meta && D.github_meta.url) {
     const text = await fetchSrc(D.github_meta, 30000)
     let meta = null
     try { meta = text ? parseMeta(JSON.parse(text)) : null } catch (e) { meta = null }
+    if (meta && !Object.keys(meta).length) meta = null
+    let fromCacheH = -1
+    if (meta) {
+      try { fs.writeFileSync(META_CACHE, JSON.stringify({ at: Date.now(), services: meta }, null, 1)) } catch (e) {}
+    } else {
+      const c = readMetaCache()
+      if (c && c.services && Object.keys(c.services).length) {
+        const ageH = (Date.now() - (c.at || 0)) / 3600e3
+        if (ageH <= META_CACHE_MAX_H) { meta = c.services; fromCacheH = Math.round(ageH) }
+        else log('GitHub /meta 缓存已过 ' + Math.round(ageH) + 'h（上限 ' + META_CACHE_MAX_H + 'h），弃用')
+      }
+    }
     if (meta) {
       sources.github_meta = Object.keys(meta)
+      if (fromCacheH >= 0) sources.github_meta_cached_h = fromCacheH
       for (const dom of Object.keys(D.gh_domains || {})) {
         for (const svc of D.gh_domains[dom]) {
           for (const cidr of (meta[svc] || [])) {
@@ -168,7 +202,7 @@ async function main() {
           }
         }
       }
-      log('GitHub /meta 已解析：' + Object.keys(meta).length + ' 个服务')
+      log('GitHub /meta ' + (fromCacheH >= 0 ? '取不到，用上次缓存（' + fromCacheH + 'h 前）：' : '已解析：') + Object.keys(meta).length + ' 个服务')
     } else log('GitHub /meta 取不到，跳过（不影响其它来源）')
   }
 
@@ -231,6 +265,14 @@ if (ARGV.includes('--selftest')) {
   T('/22 每 /24 抽一个', b.length, 4)
   T('/22 落在不同 /24', dedupe(b.map(function (x) { return x.split('.').slice(0, 3).join('.') })).length, 4)
   T('非 v4 段返回空', sampleCidr4('2606:50c0::/32', 1, rnd).length, 0)
+  // v6 抽样（2026-10-13 修）：/128 单地址必须原样返回；带 :: 的网段不能再拼出三冒号非法地址
+  T('v6 /128 原样返回', sampleCidr6('2606:50c0:8000::153/128', 1), ['2606:50c0:8000::153'])
+  T('v6 无前缀按 /128 原样', sampleCidr6('2606:50c0:8000::153', 1), ['2606:50c0:8000::153'])
+  const v6s = sampleCidr6('2606:50c0::/32', 4)
+  T('v6 /32 抽样数量', v6s.length, 4)
+  T('v6 抽样全部合法形式', v6s.every(function (x) { return isV6(x) && fam(x) === 6 }), true)
+  T('v6 抽样前缀正确', v6s[0], '2606:50c0:0:0::1')
+  T('isV6 拒三冒号等非法形式', [isV6('2606:50c0:8000:::1'), isV6('2606:50c0::::1'), isV6('a::b::c')], [false, false, false])
   // /meta 解析：只收 CIDR 数组（单 IP 与域名列表丢掉）
   T('parseMeta 只收 CIDR 数组', parseMeta({ web: ['140.82.112.0/20'], hooks: ['1.2.3.4'], domains: ['github.com'] }), { web: ['140.82.112.0/20'] })
   // DoH 解析
