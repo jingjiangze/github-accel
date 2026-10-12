@@ -17,7 +17,12 @@ const STATE = path.join(HERE, 'pool-state.json')
 const CANDS = path.join(HERE, 'candidates.json')
 
 function isV4(s) { return /^\d{1,3}(\.\d{1,3}){3}$/.test(String(s || '').trim()) }
-function isV6(s) { const t = String(s || '').trim(); return t.indexOf(':') >= 0 && /^[0-9a-fA-F:]+$/.test(t) }
+// 形式收严（2026-10-13）：与 discover/accel 同步，拒三冒号等非法形式
+// （池子里曾有 "2606:50c0:8000:::1" 这类垃圾，宽松正则会把它当有效 v6 参与择优）
+function isV6(s) {
+  const t = String(s || '').trim()
+  return t.indexOf(':') >= 0 && /^[0-9a-fA-F:]+$/.test(t) && t.indexOf(':::') < 0 && t.split('::').length <= 2
+}
 function fam(ip) { return isV4(ip) ? 4 : (isV6(ip) ? 6 : 0) }
 function key(dom, ip) { return dom + '|' + ip }
 // 同一 /24（v4）或 /64（v6）当作一个故障域，避免一撮候选全落在同一个前缀里

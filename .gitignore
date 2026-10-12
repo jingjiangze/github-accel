@@ -6,6 +6,7 @@ proxy-state.json
 candidates.json
 pool-state.json
 manifest-cache.json
+meta-cache.json
 run.lock
 .selftest/
 *.part

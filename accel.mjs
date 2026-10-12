@@ -87,7 +87,13 @@ async function pool(items, size, worker) {
   await Promise.all(Array.from({ length: Math.max(1, Math.min(size, items.length)) }, slot))
   return out
 }
-function fam(ip) { return IPV4.test(ip) ? 4 : (IPV6.test(ip) && ip.indexOf(':') >= 0 ? 6 : 0) }
+// v6 形式收严（2026-10-13）：IPV6 宽松正则会接受 "2606:50c0:8000:::1" 这种三冒号垃圾，
+// hosts 读取与候选池过滤都经过 fam()，先把非法形式挡掉（否则垃圾被当有效 v6 钉进 hosts）
+function isV6Form(ip) {
+  const t = String(ip)
+  return IPV6.test(t) && t.indexOf(':') >= 0 && t.indexOf(':::') < 0 && t.split('::').length <= 2
+}
+function fam(ip) { return IPV4.test(ip) ? 4 : (isV6Form(ip) ? 6 : 0) }
 
 // 代理内核（mihomo/Clash）的 fake-ip 段。系统解析落在这里 = DNS 被 TUN 的 dns-hijack 接管：
 // 此时 hosts 层被架空，写进去的固定也必然复核失败，工具会把自己上一轮的固定全部撤销。
@@ -210,6 +216,10 @@ async function dohResolve(dom, type) {
 async function sysA(dom) { try { return (await dnsp.lookup(dom)).address } catch (e) { return null } }
 async function sysAAAA(dom) { try { return (await dnsp.resolve6(dom))[0] || null } catch (e) { return null } }
 
+// 一个域「什么响应码算通」：域级 expect 优先，其次是全局 ok_codes。
+// probeOnce 与落地复核 verify 共用同一套，避免两处口径漂移（objects.githubusercontent.com 根路径正常就回 404）
+function allowedCodes(dom) { return (CFG.domains[dom] || {}).expect || CFG.probe.ok_codes || [200, 301, 302, 404] }
+
 // 单 IP 实测：TLS 建连 + 取回完整响应；只回头不返体（github.com 的典型症状）判为不可用
 async function probeOnce(dom, ip, canary) {
   const url = 'https://' + dom + (canary || '/')
@@ -223,7 +233,7 @@ async function probeOnce(dom, ip, canary) {
   const code = Number(m[1]), ms = Math.round(Number(m[2]) * 1000), bytes = Number(m[3])
   // 语义正确才算数：错误后端返回的 400 页比卡死更危险，会静默把域名指到别的服务上。
   // min_bytes 是给 github.com 这类"200 + 头几 KB 后就卡死"的假健康节点准备的：拿到几个字节不算通。
-  const allow = (CFG.domains[dom] || {}).expect || CFG.probe.ok_codes || [200, 301, 302, 404]
+  const allow = allowedCodes(dom)
   const minBytes = (CFG.domains[dom] || {}).min_bytes || CFG.probe.min_bytes || 1
   // max_ms：慢到离谱的候选（实测 github.com 有 8026ms 仍返回 200 的）不值得写进去——
   // 写进去复核也会被撤，白折腾一轮 hosts 和 DNS 缓存
@@ -366,10 +376,17 @@ async function verify(dom, canary, expect) {
   if (isFakeIp(rip) || isLocalIp(rip)) return { ok: true, inactive: true, remote: rip, detail: '连到 ' + rip + '（fake-ip/本地代理接管），本轮不复核，保留现有固定' }
   if (!rip) return { ok: false, remote: '', detail: '连接失败 ' + (m ? m[2] : '000') }
   if (expect.indexOf(rip) < 0) return { ok: false, remote: rip, detail: '泄漏到未钉的 ' + rip + '（写入的是 ' + expect.join('/') + '）' }
-  return { ok: true, remote: rip, code: Number(m[2]), ms: Math.round(Number(m[3]) * 1000), detail: rip + ' ' + m[2] + ' ' + Math.round(Number(m[3]) * 1000) + 'ms' }
+  // 坑（2026-10-13 修）：只核对 remote_ip 不够——TCP 连上但请求挂死/超时时 curl 仍报 remote_ip=钉的 IP、
+  // http_code=000（实测 objects 的 185.199.108.133 拿到 "000 15002ms" 仍被记「生效」，坏钉在 hosts 里留了一整天）。
+  // 落地口径与 probeOnce 对齐：响应码不在允许集里就判落地不成立，交给 planAfterLeak 撤销或补钉。
+  const code = Number(m[2])
+  const allow = allowedCodes(dom)
+  if (allow.indexOf(code) < 0) return { ok: false, remote: rip, detail: rip + ' 响应码 ' + m[2] + '（' + Math.round(Number(m[3]) * 1000) + 'ms）不在允许集 ' + allow.join('/') + '，落地不成立' }
+  return { ok: true, remote: rip, code: code, ms: Math.round(Number(m[3]) * 1000), detail: rip + ' ' + m[2] + ' ' + Math.round(Number(m[3]) * 1000) + 'ms' }
 }
 
-// 复核泄漏后该怎么办：泄漏那一族根本没写过 → 补钉它；已经写过还不贴 → 整域撤销
+// 复核失败（泄漏到别处，或连上钉了但响应码不成立）后该怎么办：
+// 失败那一族根本没写过 → 补钉它；已经写过还不成立 → 整域撤销
 function planAfterLeak(c, remote) {
   const v6 = String(remote).indexOf(':') >= 0
   const key = v6 ? 'ip6' : 'ip'
@@ -448,7 +465,7 @@ async function main() {
     const bad = []
     for (const c of list) {
       const v = await verify(c.dom, c.canary, [c.ip, c.ip6].filter(Boolean))
-      log((v.ok ? (v.inactive ? '未复核' : '生效  ') : '! 泄漏 ') + c.dom.padEnd(28) + v.detail)
+      log((v.ok ? (v.inactive ? '未复核' : '生效  ') : '! 未生效') + c.dom.padEnd(28) + v.detail)
       if (!v.ok) bad.push({ c, v })
     }
     return bad
@@ -466,7 +483,7 @@ async function main() {
     for (const b of bad) {
       const pl = planAfterLeak(b.c, b.v.remote)
       if (pl.action === 'plug') { b.c[pl.key] = pl.ip; plugged.push(b.c.dom + (pl.key === 'ip6' ? ':v6' : ':v4')) }
-      else log('  ' + b.c.dom + ' 泄漏族已写过或无候选 -> 撤销')
+      else log('  ' + b.c.dom + ' 失败族已写过或无候选 -> 撤销')
     }
     if (plugged.length) {
       log('补钉未覆盖族：' + plugged.join(' ') + ' -> 第二轮复核')
@@ -548,6 +565,30 @@ if (SELFTEST) {
     if (!ok) bad++
     console.log('  ' + (ok ? 'PASS' : 'FAIL') + '  isLocalIp(' + ip + ') = ' + isLocalIp(ip) + (ok ? '' : '，期望 ' + want))
   }
+  // 落地复核的响应码口径（2026-10-13 修）：code=000（TCP 连上但请求挂死/超时）不算落地；
+  // objects 根路径正常就回 404，不能被误判成失败
+  const codeCases = [
+    ['github.com', 0, false], ['github.com', 200, true], ['github.com', 404, false],
+    ['objects.githubusercontent.com', 404, true], ['objects.githubusercontent.com', 0, false],
+    ['raw.githubusercontent.com', 200, true], ['raw.githubusercontent.com', 503, false]
+  ]
+  for (const [dom, code, want] of codeCases) {
+    const got = allowedCodes(dom).indexOf(code) >= 0
+    const ok = got === want
+    if (!ok) bad++
+    console.log('  ' + (ok ? 'PASS' : 'FAIL') + '  落地码 ' + dom + ' code=' + code + ' -> ' + got + (ok ? '' : '，期望 ' + want))
+  }
+  // v6 形式校验（2026-10-13 修）：池子/hosts 里读到三冒号垃圾不能再当有效 v6
+  const formCases = [
+    ['2606:50c0:8000::153', 6], ['2a04:4e42:200::485', 6], ['20.205.243.166', 4],
+    ['2606:50c0:8000:::1', 0], ['2606:50c0::::1', 0], ['a::b::c', 0], ['', 0]
+  ]
+  for (const [ip, want] of formCases) {
+    const got = fam(ip)
+    const ok = got === want
+    if (!ok) bad++
+    console.log('  ' + (ok ? 'PASS' : 'FAIL') + '  fam(' + (ip || '(空)') + ') = ' + got + (ok ? '' : '，期望 ' + want))
+  }
   // 跨族选择：无 AAAA 时不能因为"v4 慢"就把比 v4 还慢的 v6 写进去
   // （线上真实踩过：cdn.jsdelivr.net 的 v4 1012ms 被 v6 1948ms 顶掉）
   const R = CFG.probe.win_ratio
@@ -569,7 +610,7 @@ if (SELFTEST) {
     console.log('  ' + (ok ? 'PASS' : 'FAIL') + '  ' + name + ' -> take4=' + !!got.take4 + ' take6=' + !!got.take6 +
       (ok ? '' : '，期望 take4=' + want4 + ' take6=' + want6))
   }
-  const total = cases.length + fakeCases.length + localCases.length + pinCases.length
+  const total = cases.length + fakeCases.length + localCases.length + codeCases.length + formCases.length + pinCases.length
   console.log(bad ? '  自测失败 ' + bad + ' 项' : '  自测 ' + total + '/' + total + ' 通过')
   process.exit(bad ? 1 : 0)
 }
