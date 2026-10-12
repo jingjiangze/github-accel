@@ -69,3 +69,23 @@ jobs:
           gh release upload accel-latest dist/accel.zip --clobber
           echo "已发布 https://github.com/${GITHUB_REPOSITORY}/releases/download/accel-latest/accel.zip"
           echo "本次 commit $(git rev-parse --short HEAD)"
+
+      # 同时把 zip 推到 pkg 分支（单提交 force-push，与 manifest 分支同形），
+      # 这样 jsDelivr 镜像直链 https://cdn.jsdelivr.net/gh/<repo>@pkg/accel.zip 也能自动滚动，
+      # 而这条直链在 raw.githubusercontent.com 被墙的线路上比 release 直链稳。
+      - name: 发布到 pkg 分支（供 jsDelivr 镜像直链）
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          test -s dist/accel.zip || { echo "::error::dist/accel.zip 缺失"; exit 1; }
+          cd dist
+          git init -q
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git checkout -q -b pkg
+          git add accel.zip
+          git commit -q -m "pkg: $(date -u +%FT%TZ) ($(git rev-parse --short HEAD 2>/dev/null || echo ci))"
+          git push -q -f "https://x-access-token:${GH_TOKEN}@github.com/${GITHUB_REPOSITORY}.git" pkg
+          echo "已发布镜像直链 https://cdn.jsdelivr.net/gh/${GITHUB_REPOSITORY}@pkg/accel.zip"
+          cd ..

@@ -72,6 +72,102 @@ node pack.mjs --verify dist/accel.zip     :: 校验「包内条目 == 白名单�
 `pack.mjs` 是零依赖的（压缩用内置 `zlib`，CRC32 自己实现——Node 20 还没有 `zlib.crc32`，而 CI 用 Node 20）；
 CI 里除了自研读取器，还会用 `unzip -t` 这个独立实现再复验一遍。
 
+### 下载直链（含镜像源）
+
+GitHub Release 直链（PR 合并后自动滚动覆盖）：
+
+```
+https://github.com/jingjiangze/github-accel/releases/download/accel-latest/accel.zip
+```
+
+`raw.githubusercontent.com` 被墙的线路上更稳的 **jsDelivr 镜像直链**（同一份 zip，由 pack.yml 推到 `pkg` 分支，
+每次 push 到 main 自动 force-push 覆盖，所以也跟着滚动更新）：
+
+```
+https://cdn.jsdelivr.net/gh/jingjiangze/github-accel@pkg/accel.zip
+```
+
+两条直链指向同一份字节（`sha256` 一致），选能通的即可。下载走竞速：
+
+```bat
+:: 用本项目自己的竞速器下载发行包（多入口竞速，比裸 curl 稳）
+node gh.mjs https://github.com/jingjiangze/github-accel/releases/download/accel-latest/accel.zip -o accel.zip
+```
+
+### 安装指南
+
+包解压后就是一个**零依赖的 Node 脚本目录**，不写注册表、不留常驻进程。安装 = 解压到任意目录 +（可选）装计划任务。
+
+#### 人类安装指南
+
+1. 选一个安装目录（**随便放哪都行**，例如 `D:\tools\accel` 或 `C:\Users\你\accel`）。建议避开带空格/中文的路径，
+   也别放进 `Program Files`（写入 hosts 不需要管理员，但放系统目录反而容易权限纠缠）。
+2. 把 `accel.zip` 解压到那个目录（保留内部目录结构，`install-task.ps1` / `run-hidden.vbs` 要和 `accel.mjs` 同级）。
+3. 装好 [Node.js 20+](https://nodejs.org/)（只依赖内置 `fetch` / `zlib`，无需 `npm install`）。
+4. 首次先 dry-run 看判定、**不写文件**：
+   ```bat
+   cd 你选的目录
+   node accel.mjs --dry -v
+   ```
+5. 确认无误后正式写入（自动备份原 hosts，只替换 `# >>> accel-start >>>` 标记块）：
+   ```bat
+   node accel.mjs
+   ```
+6. **（可选）热更新**：装一个无窗口计划任务，按你想要的间隔自动重测重写 hosts + 刷新清单。
+   ```bat
+   :: 默认每 10 分钟一轮
+   powershell -NoProfile -ExecutionPolicy Bypass -File install-task.ps1
+   :: 或：每天一轮（最省占用，推荐）
+   powershell -NoProfile -ExecutionPolicy Bypass -File install-task.ps1 -IntervalMinutes 1440
+   :: 或：每 6 小时一轮
+   powershell -NoProfile -ExecutionPolicy Bypass -File install-task.ps1 -IntervalMinutes 360
+   ```
+   任务名默认 `QoderAccel`（`config.json` 的 `task_name`），想换名加 `-TaskName 你的名字`。
+   装之前脚本会探测 hosts 是否可写：当前用户能写就 Limited 不提权；不能写且非管理员会直接报错，不会装一个「跑十年什么都不干」的死任务。
+7. 回滚：
+   ```bat
+   node accel.mjs --revert
+   schtasks /delete /tn QoderAccel /f
+   ```
+
+#### 给 Agent / 自动化安装指南
+
+把下面这段交给一个能跑 PowerShell + 有网络 + 装了 Node 的 agent 即可（它会自己选目录、下载、装热更新）：
+
+```powershell
+# Agent 安装 accel（无交互）：选目录 -> 镜像源下载 -> 解压 -> 装每天一轮热更新
+$InstallDir = "C:\tools\accel"          # 让 agent/用户改这一行选安装目录
+$Node = (Get-Command node -ErrorAction SilentlyContinue).Source
+if (-not $Node) { Write-Error "请先装 Node.js 20+ (https://nodejs.org)"; exit 1 }
+if (-not (Test-Path $InstallDir)) { New-Item -ItemType Directory -Force -Path $InstallDir | Out-Null }
+
+# 优先 jsDelivr 镜像直链；失败回退 GitHub release 直链
+$Zip = Join-Path $env:TEMP "accel.zip"
+$urls = @(
+  "https://cdn.jsdelivr.net/gh/jingjiangze/github-accel@pkg/accel.zip",
+  "https://github.com/jingjiangze/github-accel/releases/download/accel-latest/accel.zip"
+)
+$ok = $false
+foreach ($u in $urls) {
+  try { Invoke-WebRequest -Uri $u -OutFile $Zip -UseBasicParsing -TimeoutSec 60; if ((Get-Item $Zip).Length -gt 1000) { $ok = $true; break } }
+  catch { Write-Warning ("下载失败: " + $u) }
+}
+if (-not $ok) { Write-Error "两个直链都下载失败"; exit 1 }
+
+Expand-Archive -Path $Zip -DestinationPath $InstallDir -Force
+Set-Location $InstallDir
+# 先 dry-run 确认不会写坏，再正式写入
+node accel.mjs --dry -v
+node accel.mjs
+# 装每天一轮热更新（最小占用）；要更频繁改 -IntervalMinutes
+powershell -NoProfile -ExecutionPolicy Bypass -File (Join-Path $InstallDir "install-task.ps1") -IntervalMinutes 1440
+Write-Output ("accel 已装到 " + $InstallDir + "，任务 QoderAccel 每天一轮")
+```
+
+要点：① 安装目录由 `$InstallDir` 一处控制，agent 可提示用户选择；② 下载优先走 jsDelivr 镜像、回退 GitHub；
+③ 解压后先 `--dry` 再正式写入；④ 热更新间隔由 `-IntervalMinutes` 决定（1440=每天、360=每 6h、默认 10）；
+⑤ 全部零依赖、无常驻进程、不写系统目录之外任何东西。
+
 ## 为什么不做成"直接改 hosts 就完事"的加速器
 
 这些是本仓库所有判定的来源，都是**同一台机器同一时段**的实测数字，不是转述：
