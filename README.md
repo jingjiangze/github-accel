@@ -224,6 +224,7 @@ node pool.mjs show github.com     :: 只看某个域
   **内容级体检**（必须取回约定 canary 内容）+ **带宽样本**（真拉够一段数据），结果写成 `proxies.json`，
   发布到 `manifest` 分支（单提交 + force-push，天然滚动更新，不留历史）。
 - 本机 `gh.mjs` 按 `config.json` 的 `manifest` 段取这份清单（先 raw、再 jsDelivr，全失败退回本地缓存），
+- 本机 `gh.mjs` 按 `config.json` 的 `manifest` 段取这份清单（先 jsDelivr 镜像、再 raw 兜底，全失败退回本地缓存），
   把 `ok=true` 的入口并进候选池、标成 `[清]`，**和候选池一样只做低频测量、不参与竞速**——
   runner 的速度数字对本机线路没有参考价值，排名仍由本机实测决定（见「为什么是竞速而不是选最快的入口」）。
 
