@@ -469,10 +469,38 @@ npx wrangler pages deploy --branch main
 | 回滚后（同一份原始配置） | **3/3，0.20s** | **3/3，0.19s** | 与改动无关，只是线路自己变好了 |
 
 第三行是重点：**同一份配置几分钟内从 1/3 变 3/3**，所以静态分流方案的收益无法与波动区分，
-而代价是全局流量路径的风险，本工具因此不碰你的代理配置。要真做自适应分流，正解是
-mihomo 的 `fallback` 组（`DIRECT` ↔ 节点，60s 体检）——注意 CV 的 **Merge 里加 `proxy-groups`
-会被内核校验拒绝**，自定义组要走"代理组文件"（本机已有 `profiles/g7Y3DfeOQCW6.yaml` 那种）。
-另：顶层 `hosts:` 映射经测试实例验证**不被 fake-ip 模式采用**，别再指望它。
+而代价是全局流量路径的风险。要真做自适应分流，正解是 mihomo 的 `fallback` 组（`DIRECT` ↔ 节点，60s 体检）。
+
+### 2026-10-13 复核：结论细化（含「hosts 侦测 Clash」的可行性）
+
+用户提出「hosts 侦测到 Clash 后自动写入当前节点」。逐条实测：
+
+| 设想/做法 | 实测结论 |
+|---|---|
+| **读 Clash 当前节点** | ✅ 能。TCP 控制器常被关，**只有命名管道**（`\\.\pipe\verge-mihomo-*`，**必须枚举**——配置里写的名字已过期）。用 `node:http` 的 `socketPath` 读最稳 → 见 `clash.mjs`。注意 `/proxies` **不返回节点 server**（安全设计），所以"读节点 IP"不可靠。 |
+| **把节点 IP 写进 hosts** | ❌ **不成立**。节点是 Cloudflare IP、只认 `SNI=订阅域`；把它的 IP 当目标域名地址，实测 3/3 失败（连接重置 / TLS 握手失败）。hosts 只能做「域名→真实服务器 IP」，做不了「域名→代理」。 |
+| **让 mihomo 采纳 hosts 钉**（`dns.use-system-hosts: true`） | ❌ **实测无效**。置 true 后问 mihomo 自己的 DNS（`/dns/query`）：`api.github.com` 返回 `20.205.243.168`，而 hosts 钉的是 `20.27.177.116` → 没采纳。与上面"顶层 `hosts:` 不被采用"是同一条结论的两面。 |
+| **加自定义组** | ✅ **走"脚本档"可以**（`profiles/Script.js` 里改 `config['proxy-groups']`）。补一条上面那条的边界：Merge 档加 `proxy-groups` 会被内核校验拒，**脚本档不会被拒**。 |
+
+**因此本工具与 Clash 的正确关系是"各管各的、互不干扰"**：
+- **hosts 层（本工具）** 只服务**直连**流量（不吃系统代理的 CLI / 软件）。
+- **Clash 层** 服务走代理的流量，用它自己的 DNS；**它不会用 hosts 的钉，也无法让它用**。
+- 唯一有意义的协作是**路由层面**：把 github 家族规则指到「直连优先」组，让走代理的 github 也走直连（避开烂节点）。
+  这需要改 Clash 配置（见下），**不属于本仓库的职责**，本仓库只提供 `clash.mjs` 侦测 + 报告。
+
+**本机已落地的 Clash 侧配置**（在 `%APPDATA%\io.github.clash-verge-rev.clash-verge-rev\profiles\Script.js`，
+备份 `Script.js.bak-20261013`）：加 `GH直连优先` fallback 组（`[DIRECT, 🚀 节点选择]`，探测 `https://github.com/`）
++ 前置 4 条 github 规则指向它。生效需重启 Verge；回退 = 用备份覆盖 + 重启。
+
+### 实测记录（2026-10-13，供复核）
+
+| 场景 | 结果 |
+|---|---|
+| `api.github.com` 经代理 | 200 / 0.18s（走 GH 组 → DIRECT） |
+| `github.com` 经代理 | 超时 / TLS 失败（**该域当前未被钉**，且直连本身也抖动） |
+| `www.google.com` 经代理 | 200 / 6.4s（走节点，符合预期） |
+| GH 组健康检查（探测 github.com） | 本次 `Timeout` → 按设计回落节点 |
+| 直连 `api.github.com` | 200 / 0.19s（hosts 钉生效） |
 
 ## 参考
 
