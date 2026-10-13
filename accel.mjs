@@ -17,6 +17,7 @@ import { open as openPool } from './pool.mjs'
 import { fam, isFakeIp, isLocalIp } from './ip.mjs'
 import { parseProbeOut, parseVerifyOut, judgeProbe, summarizeProbes, judgeVerify } from './probe.mjs'
 import { readHosts, parsePins, commitHosts } from './hostsio.mjs'
+import { readState as readClashState, describe as describeClash } from './clash.mjs'
 
 const HERE = path.dirname(fileURLToPath(import.meta.url))
 // 候选健康池（pool.mjs）：每轮只探一小撮，探完写回历史。未启用时为 null，走旧的候选来源。
@@ -351,6 +352,17 @@ async function main() {
   // 交互式 shell 常带 http_proxy/https_proxy：本轮 curl 已用 --noproxy 强制直连，这里只做提示
   const proxied = ['http_proxy', 'https_proxy', 'all_proxy', 'HTTP_PROXY', 'HTTPS_PROXY', 'ALL_PROXY'].filter(function (k) { return process.env[k] })
   if (proxied.length) log('提示：环境里有 ' + proxied.join('/') + '，本轮实测已 --noproxy 强制直连（换空环境跑更接近计划任务的结论）')
+  // Clash 侦测（2026-10-13）：读本机 mihomo 状态（只读命名管道），写进报告并提示"钉会不会被代理绕过"
+  const clash = await readClashState()
+  log('Clash：' + describeClash(clash))
+  if (clash.up) {
+    if (clash.githubDirect) {
+      log('  github 家族由「GH直连优先」组接管：当前 ' + clash.githubDirect.now + '（直连优先，不通自动回落节点）')
+    } else if (clash.viaNode) {
+      log('  提示：github 家族当前由出口节点接管（' + ((clash.end && clash.end.name) || '?') +
+        '）；走系统代理的应用不读 hosts，hosts 钉只服务直连流量。')
+    }
+  }
   // 代理内核接管 DNS（fake-ip）时本轮整体跳过：写了也复核不了，还会把上一轮写好的固定全撤销
   const env = await fakeEnv()
   if (env.active) {
@@ -377,7 +389,9 @@ async function main() {
   log(POOL.on
     ? '候选池已启用：每域每轮探 ' + ((CFG.pool && CFG.pool.probe_per_round) || 8) + ' 个（exploit + explore）'
     : '候选池未启用（缺 candidates.json 或 pool.enabled=false），本轮沿用旧候选来源')
-  const report = { at: new Date().toISOString(), env: env, pool: { enabled: POOL.on }, domains: {} }
+  const report = { at: new Date().toISOString(), env: env, clash: clash.up
+    ? { up: true, version: clash.version, mode: clash.mode, tun: clash.tun, mixedPort: clash.mixedPort, end: clash.end, viaNode: clash.viaNode, githubDirect: clash.githubDirect }
+    : { up: false }, pool: { enabled: POOL.on }, domains: {} }
   const chosen = []
   for (const dom of Object.keys(CFG.domains)) {
     if (CFG.deny.indexOf(dom) >= 0 || !DOMRE.test(dom)) continue

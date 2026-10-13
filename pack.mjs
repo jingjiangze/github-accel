@@ -39,6 +39,7 @@ const RUNTIME_FILES = [
   'ip.mjs',             // A 层模块：IP 形式校验/分类（net.isIP 严格）
   'probe.mjs',          // A 层模块：探测/复核判定（纯函数）
   'hostsio.mjs',        // A 层模块：hosts 安全提交（备份+直写+读回）
+  'clash.mjs',          // A 层模块：只读侦测本机 Clash(mihomo) 状态
   'gh.mjs',             // B 层：反代入口竞速取件
   'manifest.mjs',       // 反代入口体检 -> 清单
   'discover.mjs',       // 候选发现
