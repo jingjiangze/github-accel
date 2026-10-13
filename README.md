@@ -488,9 +488,17 @@ npx wrangler pages deploy --branch main
 - 唯一有意义的协作是**路由层面**：把 github 家族规则指到「直连优先」组，让走代理的 github 也走直连（避开烂节点）。
   这需要改 Clash 配置（见下），**不属于本仓库的职责**，本仓库只提供 `clash.mjs` 侦测 + 报告。
 
-**本机已落地的 Clash 侧配置**（在 `%APPDATA%\io.github.clash-verge-rev.clash-verge-rev\profiles\Script.js`，
-备份 `Script.js.bak-20261013`）：加 `GH直连优先` fallback 组（`[DIRECT, 🚀 节点选择]`，探测 `https://github.com/`）
-+ 前置 4 条 github 规则指向它。生效需重启 Verge；回退 = 用备份覆盖 + 重启。
+**尝试过并已回滚**（2026-10-13，证据留档免得再踩）：给 Clash 加 `GH直连优先` fallback 组
+（`[DIRECT, 🚀 节点选择]`）+ 前置 github 规则，让走代理的 github 改走直连。**回滚原因（两条实测）**：
+
+1. **没有收益**：mihomo 不用 hosts 钉（见上表第 3 行），所以"直连优先"拿不到 accel 的优选 IP。
+2. **引入回归**：mihomo 的 `fallback` 对 `DIRECT` 不做有效体检（实测 `now=DIRECT` 而 `alive=false`，
+   健康检查 `Timeout` 也不切换），于是 github 被**强制直连**；github.com 直连不通时，
+   连 `git push` 经代理都失败（本机实测回归，回滚后立即恢复）。
+
+→ **结论：不要用 fallback 组把域从节点改到 DIRECT**。让订阅的规则保持原样；
+hosts 与 Clash 的正确关系就是"各管各的"（hosts 服务直连流量，Clash 服务代理流量）。
+本仓库只提供 `clash.mjs` 侦测 + 报告，**不碰你的代理配置**。
 
 ### 实测记录（2026-10-13，供复核）
 
