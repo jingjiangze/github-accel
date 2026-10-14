@@ -621,7 +621,7 @@ if (SELFTEST) {
     console.log('  ' + (ok ? 'PASS' : 'FAIL') + '  ' + name + ' -> take4=' + !!got.take4 + ' take6=' + !!got.take6 +
       (ok ? '' : '，期望 take4=' + want4 + ' take6=' + want6))
   }
-  const total = cases.length + codeCases.length + wireCases.length + pinCases.length
+  const total = cases.length + codeCases.length + wireCases.length + pinCases.length + 1
   console.log(bad ? '  自测失败 ' + bad + ' 项' : '  自测 ' + total + '/' + total + ' 通过')
   process.exit(bad ? 1 : 0)
 }
