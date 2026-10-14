@@ -31,11 +31,11 @@ v2（2026-10-13）把这套守护做细了：落地复核 = **系统解析整链
 
 ## 覆盖哪些域（2026-10-13 实测口径）
 
-**进 A 层的域 = 「换 IP 救得回来」+「有可信候选源」两个条件都满足**，不是列得越多越好：
+**进 A 层的域 = 「换 IP 救得回来」+「有可信候选源」两个条件都满足**，不是列得越多越好。GitHub 自有核心域由代码级安全规则排除静态 hosts 固定，以免短暂成功的地址在下一轮失效：
 
 | 分类 | 域 | 候选来源 |
 |---|---|---|
-| GitHub | `github.com`、`api.github.com`、`codeload.github.com`、`raw`/`objects`/`avatars`/`githubassets` | GitHub `/meta`（带缓存兜底）+ DoH + 第三方 hosts hint |
+| GitHub 核心域 | `github.com`、`api.github.com`、`codeload.github.com`、`raw`/`objects`/`avatars`/`githubassets` | **不静态钉 hosts**；动态 DNS 负责解析，`gh.mjs` 负责下载/克隆镜像竞速与官方直连回退 |
 | Cloudflare 前置 | `cdn.jsdelivr.net`、`registry.npmjs.org`、`sourceforge.net`、`downloads.sourceforge.net`、`cloudflare.com`、`cdnjs.cloudflare.com`、`unpkg.com` | Cloudflare `ips-v4`/`ips-v6`（官方）+ DoH |
 | Fastly 前置 | `pypi.org`、`files.pythonhosted.org` | Fastly `public-ip-list`（官方）+ DoH |
 
