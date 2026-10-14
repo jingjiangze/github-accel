@@ -41,6 +41,58 @@ const NEVER_PIN_DOMAINS = new Set([
   'avatars.githubusercontent.com', 'github.githubassets.com'
 ])
 
+// Remove only GitHub core pins from our managed hosts block. This is safe even when a proxy
+// fake-IP environment prevents fresh probes; retain unrelated CDN/package pins and hand-written lines.
+function stripProtectedPinsFromBlock(block) {
+  const lines = String(block || '').split(/\r?\n/)
+  const start = lines.findIndex(function (line) { return line.trim() === MARK_S })
+  const end = lines.findIndex(function (line, i) { return i > start && line.trim() === MARK_E })
+  if (start < 0 || end < 0) return { block: block, changed: false }
+  let changed = false
+  const out = lines.slice(0, start + 1)
+  for (let i = start + 1; i < end; i++) {
+    const line = lines[i]
+    const trimmed = line.trim()
+    if (!trimmed || trimmed.charAt(0) === '#') { out.push(line); continue }
+    const fields = trimmed.split(/\s+/)
+    if (fields.length < 2) { out.push(line); continue }
+    const keep = fields.slice(1).filter(function (domain) {
+      return !NEVER_PIN_DOMAINS.has(domain.toLowerCase())
+    })
+    if (keep.length !== fields.length - 1) changed = true
+    if (keep.length) out.push(fields[0] + '  ' + keep.join('  '))
+    else if (keep.length === fields.length - 1) out.push(line)
+  }
+  out.push.apply(out, lines.slice(end))
+  return { block: out.join('\r\n'), changed: changed }
+}
+async function removeProtectedPinsFromHosts() {
+  if (DRY) return false
+  const cur = readHosts(CFG.hosts_path)
+  if (cur === null) return false
+  const start = cur.indexOf(MARK_S)
+  const end = cur.indexOf(MARK_E, start + MARK_S.length)
+  if (start < 0 || end < 0) return false
+  const managed = cur.slice(start, end + MARK_E.length)
+  const filtered = stripProtectedPinsFromBlock(managed)
+  if (!filtered.changed) return false
+  const result = await commitHosts({
+    hostsPath: CFG.hosts_path,
+    bdir: path.join(HERE, 'backups'),
+    block: filtered.block,
+    markS: MARK_S,
+    markE: MARK_E,
+    keep: 5
+  })
+  if (!result.ok) {
+    log('保护性清理 GitHub hosts 固定未成立：' + result.reason + (result.error ? ' ' + result.error : ''))
+    return false
+  }
+  await run('ipconfig.exe', ['/flushdns'], 8000)
+  log('保护性清理完成：仅移除本工具块内的 GitHub 核心域固定，保留其他域的固定')
+  return true
+}
+
 function now() { return new Date().toISOString().slice(11, 19) }
 function log() {
   const line = now() + ' ' + Array.from(arguments).join(' ')
@@ -381,7 +433,8 @@ async function main() {
   const env = await fakeEnv()
   if (env.active) {
     log('环境：系统解析 ' + env.domain + ' -> ' + env.ip + ' = fake-ip（代理内核接管 DNS）')
-    log('==== 本轮跳过：hosts 层被架空，保留现有固定，不写也不撤（report.json 留上一轮） ====')
+    await removeProtectedPinsFromHosts()
+    log('==== 本轮跳过 IP 测速与选路；已尽力清理本工具块内的 GitHub 核心域旧固定，其他域固定保留 ====')
     return
   }
   // 候选过期就顺手刷新一次（discover 自己也会判有效期；这里保证它不会永远不跑）。
@@ -590,6 +643,14 @@ if (SELFTEST) {
   const protectedOk = protectedDomains.every(function (d) { return NEVER_PIN_DOMAINS.has(d) })
   if (!protectedOk) bad++
   console.log('  ' + (protectedOk ? 'PASS' : 'FAIL') + '  GitHub 核心域禁止静态 hosts 固定' + (protectedOk ? '' : '（缺失保护域名）'))
+  const sampleBlock = [MARK_S, '# generated', '1.2.3.4  github.com  other.example', '2.2.2.2  raw.githubusercontent.com', '3.3.3.3  cdn.jsdelivr.net', MARK_E].join('\\r\\n')
+  const cleanedBlock = stripProtectedPinsFromBlock(sampleBlock)
+  const cleanupOk = cleanedBlock.changed && cleanedBlock.block.indexOf('github.com') < 0 &&
+    cleanedBlock.block.indexOf('raw.githubusercontent.com') < 0 &&
+    cleanedBlock.block.indexOf('1.2.3.4  other.example') >= 0 &&
+    cleanedBlock.block.indexOf('3.3.3.3  cdn.jsdelivr.net') >= 0
+  if (!cleanupOk) bad++
+  console.log('  ' + (cleanupOk ? 'PASS' : 'FAIL') + '  fake-IP 早退清理只移除核心域，保留其他域固定' + (cleanupOk ? '' : '（结果不符）'))
   // 模块接线自检：ip.mjs 的严格校验确实被本进程用上（垃圾形式一律为 0）
   const wireCases = [
     ['2606:50c0:8000::153', 6], ['104.17.208.5', 4], ['2606:50c0:8000:::1', 0], ['', 0]
@@ -621,7 +682,7 @@ if (SELFTEST) {
     console.log('  ' + (ok ? 'PASS' : 'FAIL') + '  ' + name + ' -> take4=' + !!got.take4 + ' take6=' + !!got.take6 +
       (ok ? '' : '，期望 take4=' + want4 + ' take6=' + want6))
   }
-  const total = cases.length + codeCases.length + wireCases.length + pinCases.length + 1
+  const total = cases.length + codeCases.length + wireCases.length + pinCases.length + 2
   console.log(bad ? '  自测失败 ' + bad + ' 项' : '  自测 ' + total + '/' + total + ' 通过')
   process.exit(bad ? 1 : 0)
 }
