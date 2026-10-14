@@ -33,6 +33,65 @@ const REVERT = ARGV.includes('--revert')
 const VERBOSE = ARGV.includes('-v')
 const SELFTEST = ARGV.includes('--selftest')
 const DOMRE = /^[a-z0-9._-]+$/i
+// Critical GitHub web/resource endpoints must use current DNS. This code-level invariant prevents
+// a briefly healthy IP pin turning into a machine-wide outage between scheduled maintenance runs.
+const NEVER_PIN_DOMAINS = new Set([
+  'github.com', 'gist.github.com', 'api.github.com', 'codeload.github.com',
+  'raw.githubusercontent.com', 'objects.githubusercontent.com',
+  'avatars.githubusercontent.com', 'github.githubassets.com'
+])
+
+// Remove only GitHub core pins from our managed hosts block. This is safe even when a proxy
+// fake-IP environment prevents fresh probes; retain unrelated CDN/package pins and hand-written lines.
+function stripProtectedPinsFromBlock(block) {
+  const lines = String(block || '').split(/\r?\n/)
+  const start = lines.findIndex(function (line) { return line.trim() === MARK_S })
+  const end = lines.findIndex(function (line, i) { return i > start && line.trim() === MARK_E })
+  if (start < 0 || end < 0) return { block: block, changed: false }
+  let changed = false
+  const out = lines.slice(0, start + 1)
+  for (let i = start + 1; i < end; i++) {
+    const line = lines[i]
+    const trimmed = line.trim()
+    if (!trimmed || trimmed.charAt(0) === '#') { out.push(line); continue }
+    const fields = trimmed.split(/\s+/)
+    if (fields.length < 2) { out.push(line); continue }
+    const keep = fields.slice(1).filter(function (domain) {
+      return !NEVER_PIN_DOMAINS.has(domain.toLowerCase())
+    })
+    if (keep.length !== fields.length - 1) changed = true
+    if (keep.length) out.push(fields[0] + '  ' + keep.join('  '))
+    else if (keep.length === fields.length - 1) out.push(line)
+  }
+  out.push.apply(out, lines.slice(end))
+  return { block: out.join('\r\n'), changed: changed }
+}
+async function removeProtectedPinsFromHosts() {
+  if (DRY) return false
+  const cur = readHosts(CFG.hosts_path)
+  if (cur === null) return false
+  const start = cur.indexOf(MARK_S)
+  const end = cur.indexOf(MARK_E, start + MARK_S.length)
+  if (start < 0 || end < 0) return false
+  const managed = cur.slice(start, end + MARK_E.length)
+  const filtered = stripProtectedPinsFromBlock(managed)
+  if (!filtered.changed) return false
+  const result = await commitHosts({
+    hostsPath: CFG.hosts_path,
+    bdir: path.join(HERE, 'backups'),
+    block: filtered.block,
+    markS: MARK_S,
+    markE: MARK_E,
+    keep: 5
+  })
+  if (!result.ok) {
+    log('保护性清理 GitHub hosts 固定未成立：' + result.reason + (result.error ? ' ' + result.error : ''))
+    return false
+  }
+  await run('ipconfig.exe', ['/flushdns'], 8000)
+  log('保护性清理完成：仅移除本工具块内的 GitHub 核心域固定，保留其他域的固定')
+  return true
+}
 
 function now() { return new Date().toISOString().slice(11, 19) }
 function log() {
@@ -364,7 +423,10 @@ async function main() {
   log('Clash：' + describeClash(clash))
   if (clash.up) {
     if (clash.githubDirect) {
-      log('  github 家族由「GH直连优先」组接管：当前 ' + clash.githubDirect.now + '（直连优先，不通自动回落节点）')
+      // github 组现在是本机 profile 脚本改成的 url-test（按 github 体检自动回退），
+      // 不再叫「直连优先」——文案跟着实际语义走，且带上组名（订阅改名也不会说错）。
+      log('  github 家族由「' + clash.githubDirect.name + '」组接管（' + clash.githubDirect.type +
+        '）：当前 ' + clash.githubDirect.now + '（按 github 可达性自动选择）')
     } else if (clash.viaNode) {
       log('  提示：github 家族当前由出口节点接管（' + ((clash.end && clash.end.name) || '?') +
         '）；走系统代理的应用不读 hosts，hosts 钉只服务直连流量。')
@@ -374,7 +436,8 @@ async function main() {
   const env = await fakeEnv()
   if (env.active) {
     log('环境：系统解析 ' + env.domain + ' -> ' + env.ip + ' = fake-ip（代理内核接管 DNS）')
-    log('==== 本轮跳过：hosts 层被架空，保留现有固定，不写也不撤（report.json 留上一轮） ====')
+    await removeProtectedPinsFromHosts()
+    log('==== 本轮跳过 IP 测速与选路；已尽力清理本工具块内的 GitHub 核心域旧固定，其他域固定保留 ====')
     return
   }
   // 候选过期就顺手刷新一次（discover 自己也会判有效期；这里保证它不会永远不跑）。
@@ -401,7 +464,14 @@ async function main() {
     : { up: false }, pool: { enabled: POOL.on }, domains: {} }
   const chosen = []
   for (const dom of Object.keys(CFG.domains)) {
-    if (CFG.deny.indexOf(dom) >= 0 || !DOMRE.test(dom)) continue
+    if (!DOMRE.test(dom)) continue
+    if (NEVER_PIN_DOMAINS.has(dom)) {
+      report.domains[dom] = { baseline: null, baseline6: null, pinned: null, pinned6: null,
+        reason: 'safety-no-pin：GitHub 核心域保留动态 DNS，避免间歇性 IP 固定影响主站/资源' }
+      log('保护性跳过 ', dom.padEnd(28), '不写入 hosts 固定（使用动态 DNS）')
+      continue
+    }
+    if (CFG.deny.indexOf(dom) >= 0) continue
     const conf = CFG.domains[dom] || {}
     const r = await evalDomain(dom, conf, remote)
     if (r.pin4 || r.pin6) chosen.push({ dom: dom, ip: r.pin4, ip6: r.pin6, alt4: r.alt4, alt6: r.alt6, canary: conf.canary || '/' })
@@ -571,6 +641,19 @@ if (SELFTEST) {
     if (!ok) bad++
     console.log('  ' + (ok ? 'PASS' : 'FAIL') + '  落地码 ' + dom + ' code=' + code + ' -> ' + got + (ok ? '' : '，期望 ' + want))
   }
+  // Stability invariant: critical GitHub endpoints never enter the hosts pin set.
+  const protectedDomains = ['github.com', 'gist.github.com', 'api.github.com', 'codeload.github.com', 'raw.githubusercontent.com', 'objects.githubusercontent.com', 'avatars.githubusercontent.com', 'github.githubassets.com']
+  const protectedOk = protectedDomains.every(function (d) { return NEVER_PIN_DOMAINS.has(d) })
+  if (!protectedOk) bad++
+  console.log('  ' + (protectedOk ? 'PASS' : 'FAIL') + '  GitHub 核心域禁止静态 hosts 固定' + (protectedOk ? '' : '（缺失保护域名）'))
+  const sampleBlock = [MARK_S, '# generated', '1.2.3.4  github.com  other.example', '2.2.2.2  raw.githubusercontent.com', '3.3.3.3  cdn.jsdelivr.net', MARK_E].join('\r\n')
+  const cleanedBlock = stripProtectedPinsFromBlock(sampleBlock)
+  const cleanupOk = cleanedBlock.changed && cleanedBlock.block.indexOf('github.com') < 0 &&
+    cleanedBlock.block.indexOf('raw.githubusercontent.com') < 0 &&
+    cleanedBlock.block.indexOf('1.2.3.4  other.example') >= 0 &&
+    cleanedBlock.block.indexOf('3.3.3.3  cdn.jsdelivr.net') >= 0
+  if (!cleanupOk) bad++
+  console.log('  ' + (cleanupOk ? 'PASS' : 'FAIL') + '  fake-IP 早退清理只移除核心域，保留其他域固定' + (cleanupOk ? '' : '（结果不符）'))
   // 模块接线自检：ip.mjs 的严格校验确实被本进程用上（垃圾形式一律为 0）
   const wireCases = [
     ['2606:50c0:8000::153', 6], ['104.17.208.5', 4], ['2606:50c0:8000:::1', 0], ['', 0]
@@ -602,7 +685,7 @@ if (SELFTEST) {
     console.log('  ' + (ok ? 'PASS' : 'FAIL') + '  ' + name + ' -> take4=' + !!got.take4 + ' take6=' + !!got.take6 +
       (ok ? '' : '，期望 take4=' + want4 + ' take6=' + want6))
   }
-  const total = cases.length + codeCases.length + wireCases.length + pinCases.length
+  const total = cases.length + codeCases.length + wireCases.length + pinCases.length + 2
   console.log(bad ? '  自测失败 ' + bad + ' 项' : '  自测 ' + total + '/' + total + ' 通过')
   process.exit(bad ? 1 : 0)
 }
