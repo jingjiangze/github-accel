@@ -2,6 +2,15 @@
 
 面向 Windows（Git Bash / PowerShell 皆可）。两层互补，各自解决实测确认不同的故障面：
 
+## 稳定性策略（2026-10）
+
+- **不改 Clash 配置**。本仓库只管理自己的 hosts 自动化和下载/克隆工具。
+- **GitHub 主站与关键资源域不再固定静态 IP**：`github.com`、`gist.github.com`、`api.github.com`、`codeload.github.com`、`raw.githubusercontent.com`、`objects.githubusercontent.com`、`avatars.githubusercontent.com`、`github.githubassets.com` 一律使用当前 DNS。一次探测成功不能代表下一刻仍可用；写入全局 hosts 会把瞬时波动放大成整机访问故障。运行 `node accel.mjs` 会重建本工具标记块并移除旧的 GitHub 静态钉。
+- **下载：健康镜像并发竞速 → 全部失败后官方 URL 无代理直连重试**。直连回退会清除本次子进程的代理环境变量，并使用 curl `--noproxy '*'`，不改变 Clash 或系统代理设置；只在完整文件成功后才替换输出文件。
+- **克隆：镜像入口探测/重试 → 官方 GitHub URL 直连重试**。直连回退清除代理环境变量、显式清空 Git 的代理配置，而且不添加 `insteadOf` 镜像重写。若目标目录在运行前已存在，工具拒绝覆盖，不会因镜像失败删除已有文件。
+- **边界说明**：镜像回退只适用于本工具的下载与 `git clone`。浏览器页面的透明故障切换必须由浏览器/系统路由层实现；在不改变 Clash、且浏览器仍配置为 GitHub 直连的前提下，任何仓库脚本都无法保证运营商链路、DNS 或 GitHub 上游永不故障。此次改动的目标是移除本工具主动造成的坏钉，并为本工具执行的下载/克隆补齐最终直连路线。
+
+
 > **关于权限（2026-10-13 实测更新）**：写 `C:\Windows\System32\drivers\etc\hosts` 的**内容是可行的**——
 > 前提是 hosts 文件上有一条本用户的显式 ACE（本机现状：`jingjiang:(M)`，另有目录继承的 SYSTEM/Administrators 项）。
 > `drivers\etc\` **目录本身不可写**（用户在该目录无法创建/删除文件），所以"临时文件 + 原子 rename"的记录方式在这台机器上
@@ -14,7 +23,7 @@
 | 层 | 文件 | 解决什么 |
 |---|---|---|
 | A 自适应 hosts | `accel.mjs`（+ `ip` / `probe` / `hostsio` 三个模块） | 头像、raw、归档包、npm/jsDelivr、PyPI、SourceForge、cdnjs/unpkg 等**能靠 IP 救**的通道：候选 IP 逐条本机 TLS 实测，只有确实更快才写入 |
-| B 竞速取件 | `gh.mjs` | `github.com` 首跳、release 下载、`git clone` 这类**换 IP 无效**的通道：每次请求同时压多个入口，先出数据的胜出，停滞带 Range 换源续传 |
+| B 竞速取件 | `gh.mjs` | 下载/`git clone` 并发竞速镜像；镜像全失败时强制尝试官方地址直连。不是浏览器透明代理 |
 
 设计取向是**宁可不写，也不写坏**：写错的 hosts 条目比不写更糟（浏览器全站受影响），所以每条固定都要过"多轮实测 + 写入后真实解析复核"。复核若发现真实解析落到了**没钉的那一族**，先按族补钉（用另一族实测可用的候选）再复核第二轮，补不上才整域撤销。该判定（`planAfterLeak`）可用 `node accel.mjs --selftest` 离线回归。
 
@@ -22,11 +31,11 @@ v2（2026-10-13）把这套守护做细了：落地复核 = **系统解析整链
 
 ## 覆盖哪些域（2026-10-13 实测口径）
 
-**进 A 层的域 = 「换 IP 救得回来」+「有可信候选源」两个条件都满足**，不是列得越多越好：
+**进 A 层的域 = 「换 IP 救得回来」+「有可信候选源」两个条件都满足**，不是列得越多越好。GitHub 自有核心域由代码级安全规则排除静态 hosts 固定，以免短暂成功的地址在下一轮失效：
 
 | 分类 | 域 | 候选来源 |
 |---|---|---|
-| GitHub | `github.com`、`api.github.com`、`codeload.github.com`、`raw`/`objects`/`avatars`/`githubassets` | GitHub `/meta`（带缓存兜底）+ DoH + 第三方 hosts hint |
+| GitHub 核心域 | `github.com`、`api.github.com`、`codeload.github.com`、`raw`/`objects`/`avatars`/`githubassets` | **不静态钉 hosts**；动态 DNS 负责解析，`gh.mjs` 负责下载/克隆镜像竞速与官方直连回退 |
 | Cloudflare 前置 | `cdn.jsdelivr.net`、`registry.npmjs.org`、`sourceforge.net`、`downloads.sourceforge.net`、`cloudflare.com`、`cdnjs.cloudflare.com`、`unpkg.com` | Cloudflare `ips-v4`/`ips-v6`（官方）+ DoH |
 | Fastly 前置 | `pypi.org`、`files.pythonhosted.org` | Fastly `public-ip-list`（官方）+ DoH |
 

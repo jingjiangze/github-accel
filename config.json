@@ -91,6 +91,14 @@
     "low_speed_limit": 1024,
     "low_speed_time": 20
   },
+  "direct_fallback": {
+    "enabled": true,
+    "retries": 2,
+    "clone_retries": 2,
+    "connect_timeout_s": 6,
+    "speed_limit_bps": 1024,
+    "speed_time_s": 30
+  },
   "domains": {
     "api.github.com": { "canary": "/zen" },
     "raw.githubusercontent.com": { "canary": "/521xueweihan/GitHub520/main/hosts" },
