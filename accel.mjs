@@ -423,7 +423,10 @@ async function main() {
   log('Clash：' + describeClash(clash))
   if (clash.up) {
     if (clash.githubDirect) {
-      log('  github 家族由「GH直连优先」组接管：当前 ' + clash.githubDirect.now + '（直连优先，不通自动回落节点）')
+      // github 组现在是本机 profile 脚本改成的 url-test（按 github 体检自动回退），
+      // 不再叫「直连优先」——文案跟着实际语义走，且带上组名（订阅改名也不会说错）。
+      log('  github 家族由「' + clash.githubDirect.name + '」组接管（' + clash.githubDirect.type +
+        '）：当前 ' + clash.githubDirect.now + '（按 github 可达性自动选择）')
     } else if (clash.viaNode) {
       log('  提示：github 家族当前由出口节点接管（' + ((clash.end && clash.end.name) || '?') +
         '）；走系统代理的应用不读 hosts，hosts 钉只服务直连流量。')

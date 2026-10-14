@@ -40,11 +40,28 @@ export function chainEnd(chain) {
   return { kind: 'node', name: last.name }
 }
 // 汇总一份可读状态
+// github 家族实际走的策略组名（按优先级探测）。
+// 2026-10-14 修正：原先只硬编码 'GH直连优先'——那是 2026-10-13 试过并已回滚的组名
+// （见 README「尝试过并已回滚」），真实配置里根本不存在（184 个代理条目 0 命中），
+// 导致下面 githubDirect 恒为 null、accel 里对应的提示分支永不触发（死代码）。
+// 现改为：优先用订阅自带的 '🐙 GitHub'（本机 edgetunnel 订阅实测存在），
+// 再回退到历史组名，保证两种配置都能侦测到。
+const GITHUB_GROUP_NAMES = ['🐙 GitHub', 'GH直连优先']
+function findGithubGroup(proxies) {
+  if (!proxies) return null
+  for (const name of GITHUB_GROUP_NAMES) {
+    if (proxies[name]) return { name: name, group: proxies[name] }
+  }
+  // 兜底：名字里带 github 的组（订阅可能改名）
+  for (const k of Object.keys(proxies)) {
+    if (/github/i.test(k)) return { name: k, group: proxies[k] }
+  }
+  return null
+}
 export function summarize(configs, proxies, startGroup) {
   const chain = followChain(proxies || {}, startGroup || '🚀 节点选择')
   const end = chainEnd(chain)
-  // 本仓约定的 github 直连优先组（由 Clash Verge 全局脚本创建；不存在则为 null）
-  const gh = (proxies || {})['GH直连优先']
+  const gh = findGithubGroup(proxies)
   return {
     mode: (configs && configs.mode) || null,
     tun: !!(configs && configs.tun && configs.tun.enable),
@@ -53,8 +70,8 @@ export function summarize(configs, proxies, startGroup) {
     end: end,
     // 我们钉的域会不会被 Clash 丢给节点：终点是 node 就是"会"（hosts 钉对走代理的应用无效）
     viaNode: end.kind === 'node',
-    // github 家族是否有专门的直连优先组
-    githubDirect: gh ? { now: gh.now, type: gh.type } : null
+    // github 家族由哪个策略组接管、当前选中什么（无该组则为 null）
+    githubDirect: gh ? { name: gh.name, now: gh.group.now, type: gh.group.type } : null
   }
 }
 
@@ -132,6 +149,23 @@ if (isMain && process.argv.includes('--selftest')) {
   T('汇总 mode', s.mode, 'rule')
   T('汇总 viaNode', s.viaNode, true)
   T('汇总 直连组不算节点', summarize({ mode: 'rule' }, P, '直连组').viaNode, false)
+
+  // github 策略组侦测（2026-10-14 修：原先硬编码 'GH直连优先'，真实配置里不存在 → 恒 null）
+  const PG = Object.assign({}, P, {
+    '🐙 GitHub': { type: 'URLTest', now: 'DIRECT' },
+    'GH直连优先': { type: 'Fallback', now: 'DIRECT' }
+  })
+  T('侦测到订阅自带 github 组', summarize({}, PG, '🚀 节点选择').githubDirect,
+    { name: '🐙 GitHub', now: 'DIRECT', type: 'URLTest' })
+  // 只有历史组名时也要能侦测（回退）
+  T('回退到 GH直连优先', summarize({}, Object.assign({}, P, { 'GH直连优先': { type: 'Fallback', now: 'DIRECT' } }), '🚀 节点选择').githubDirect,
+    { name: 'GH直连优先', now: 'DIRECT', type: 'Fallback' })
+  // 改名兜底
+  T('改名兜底 github-ish', summarize({}, Object.assign({}, P, { 'my-github-proxy': { type: 'Selector', now: 'DIRECT' } }), '🚀 节点选择').githubDirect,
+    { name: 'my-github-proxy', now: 'DIRECT', type: 'Selector' })
+  // 完全没有 → null（不是崩）
+  T('无 github 组则为 null', summarize({}, P, '🚀 节点选择').githubDirect, null)
+
   console.log(bad ? '  自测失败 ' + bad + ' 项' : '  自测全部通过')
   process.exit(bad ? 1 : 0)
 }
