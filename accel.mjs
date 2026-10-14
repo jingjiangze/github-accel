@@ -33,6 +33,13 @@ const REVERT = ARGV.includes('--revert')
 const VERBOSE = ARGV.includes('-v')
 const SELFTEST = ARGV.includes('--selftest')
 const DOMRE = /^[a-z0-9._-]+$/i
+// Critical GitHub web/resource endpoints must use current DNS. This code-level invariant prevents
+// a briefly healthy IP pin turning into a machine-wide outage between scheduled maintenance runs.
+const NEVER_PIN_DOMAINS = new Set([
+  'github.com', 'gist.github.com', 'api.github.com', 'codeload.github.com',
+  'raw.githubusercontent.com', 'objects.githubusercontent.com',
+  'avatars.githubusercontent.com', 'github.githubassets.com'
+])
 
 function now() { return new Date().toISOString().slice(11, 19) }
 function log() {
@@ -401,7 +408,14 @@ async function main() {
     : { up: false }, pool: { enabled: POOL.on }, domains: {} }
   const chosen = []
   for (const dom of Object.keys(CFG.domains)) {
-    if (CFG.deny.indexOf(dom) >= 0 || !DOMRE.test(dom)) continue
+    if (!DOMRE.test(dom)) continue
+    if (NEVER_PIN_DOMAINS.has(dom)) {
+      report.domains[dom] = { baseline: null, baseline6: null, pinned: null, pinned6: null,
+        reason: 'safety-no-pin：GitHub 核心域保留动态 DNS，避免间歇性 IP 固定影响主站/资源' }
+      log('保护性跳过 ', dom.padEnd(28), '不写入 hosts 固定（使用动态 DNS）')
+      continue
+    }
+    if (CFG.deny.indexOf(dom) >= 0) continue
     const conf = CFG.domains[dom] || {}
     const r = await evalDomain(dom, conf, remote)
     if (r.pin4 || r.pin6) chosen.push({ dom: dom, ip: r.pin4, ip6: r.pin6, alt4: r.alt4, alt6: r.alt6, canary: conf.canary || '/' })
@@ -571,6 +585,11 @@ if (SELFTEST) {
     if (!ok) bad++
     console.log('  ' + (ok ? 'PASS' : 'FAIL') + '  落地码 ' + dom + ' code=' + code + ' -> ' + got + (ok ? '' : '，期望 ' + want))
   }
+  // Stability invariant: critical GitHub endpoints never enter the hosts pin set.
+  const protectedDomains = ['github.com', 'gist.github.com', 'api.github.com', 'codeload.github.com', 'raw.githubusercontent.com', 'objects.githubusercontent.com', 'avatars.githubusercontent.com', 'github.githubassets.com']
+  const protectedOk = protectedDomains.every(function (d) { return NEVER_PIN_DOMAINS.has(d) })
+  if (!protectedOk) bad++
+  console.log('  ' + (protectedOk ? 'PASS' : 'FAIL') + '  GitHub 核心域禁止静态 hosts 固定' + (protectedOk ? '' : '（缺失保护域名）'))
   // 模块接线自检：ip.mjs 的严格校验确实被本进程用上（垃圾形式一律为 0）
   const wireCases = [
     ['2606:50c0:8000::153', 6], ['104.17.208.5', 4], ['2606:50c0:8000:::1', 0], ['', 0]
