@@ -265,8 +265,13 @@ async function evalDomain(dom, conf, remote) {
     const r = await probe(dom, j.ip, canary)
     return { ip: j.ip, kind: j.kind, fam: fam(j.ip), ok: r.ok, ms: r.ms, code: r.code, bytes: r.bytes }
   })
-  // 观测写回池子（含 baseline：系统解析答案本身好不好用也是有用信息）
-  if (POOL && POOL.on) {
+  // 观测写回池子（含 baseline：系统解析答案本身好不好用也是有用信息）。
+  // 2026-10-14 修：**整域 0 命中时不写回**——那是线路级故障（基线与全部候选一起失败），
+  // 不是"这些 IP 变坏了"。旧行为把失败记到每个候选头上 → 好 IP 攒够 3 次连续失败进 30 分钟冷却 →
+  // 恰在线路恢复时被排除，表现为"hosts 失效"（实测：github.com 的 20.27.177.113 有 52/76 成功率、
+  // 469ms，却因 fail_streak=3 被冷却，整轮不参与探测）。
+  const anyOk = res.some(function (x) { return x.ok })
+  if (POOL && POOL.on && anyOk) {
     const minSpeedBytes = (CFG.pool && CFG.pool.speed_min_bytes) || 65536
     for (const x of res) {
       // 速度直接从已有探测的 bytes/ms 推导，不额外下载；只有响应体够大才计入，
@@ -274,6 +279,8 @@ async function evalDomain(dom, conf, remote) {
       const speed = (x.ok && x.bytes >= minSpeedBytes && x.ms > 0) ? Math.round(x.bytes / (x.ms / 1000)) : 0
       POOL.record(dom, x.ip, { ok: x.ok, ms: x.ms, code: x.code, speed: speed, src: srcOf[x.ip] || (x.kind === 'base4' || x.kind === 'base6' ? 'system-dns' : '') })
     }
+  } else if (POOL && POOL.on) {
+    log('  ' + dom + '：本轮 0 命中（线路级故障），观测不写回池子（避免误伤候选失败计数）')
   }
   const byFam = function (f) { return res.filter(function (x) { return x.fam === f }).slice().sort(function (a, b) { return a.ms - b.ms }) }
   const g4 = byFam(4).filter(function (x) { return x.ok })
