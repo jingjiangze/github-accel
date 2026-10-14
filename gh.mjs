@@ -16,11 +16,13 @@ const TTL = (CFG.proxy_ttl_s || 60) * 1000
 const ARGV = process.argv.slice(2)
 const SELFTEST = ARGV.includes('--selftest')
 
-function run(exe, args, timeoutMs) {
+function run(exe, args, timeoutMs, env) {
   return new Promise(function (resolve) {
     // maxBuffer 8MB（2026-10-13 从 64MB 收紧）：内容级体检要在内存里读响应体找标记（不能设太小否则会截断体检），
     // 8MB 对"哨兵响应 + 带宽样本的尾巴"有足够余量，同时消除 64MB 的失控面。
-    execFile(exe, args, { maxBuffer: 8 * 1024 * 1024, windowsHide: true, timeout: timeoutMs || 60000, encoding: 'utf8' },
+    const opts = { maxBuffer: 8 * 1024 * 1024, windowsHide: true, timeout: timeoutMs || 60000, encoding: 'utf8' }
+    if (env) opts.env = env
+    execFile(exe, args, opts,
       function (err, out, errout) {
         resolve({ code: err ? (typeof err.code === 'number' ? err.code : 1) : 0, stdout: (out || '').trim(), stderr: (errout || '').trim() })
       })
@@ -399,6 +401,127 @@ function startCurl(url, file, resume) {
 }
 function statSize(f) { try { return fs.statSync(f).size } catch (e) { return 0 } }
 
+// Official-origin fallback must be direct, not silently reusing a shell proxy setting.
+function proxyFreeEnv() {
+  const env = Object.assign({}, process.env)
+  for (const k of ['http_proxy', 'https_proxy', 'all_proxy', 'HTTP_PROXY', 'HTTPS_PROXY', 'ALL_PROXY']) delete env[k]
+  return env
+}
+function directCurlArgs(url, file) {
+  const D = CFG.direct_fallback || {}
+  const R = CFG.race || {}
+  return ['-f', '-L', '-sS', '--noproxy', '*', '--ssl-no-revoke',
+    '--connect-timeout', String(D.connect_timeout_s || 6),
+    '--max-time', String(R.max_time_s || 900),
+    '--speed-limit', String(D.speed_limit_bps || 1024),
+    '--speed-time', String(D.speed_time_s || 30),
+    '-o', file, '-w', '%{http_code} %{size_download} %{speed_download}', url]
+}
+async function directDownloadFallback(url, name) {
+  const D = CFG.direct_fallback || {}
+  if (D.enabled === false) {
+    console.warn('  官方地址直连回退已禁用；未改写现有输出文件')
+    return false
+  }
+  const temp = name + '.part-direct'
+  const attempts = Math.max(1, Math.min(5, Number(D.retries) || 2))
+  const maxTime = Number((CFG.race || {}).max_time_s) || 900
+  for (let attempt = 1; attempt <= attempts; attempt++) {
+    try { fs.unlinkSync(temp) } catch (e) {}
+    console.warn('  镜像不可用，尝试 GitHub 官方地址直连 ' + attempt + '/' + attempts + ' ...')
+    const r = await run('curl.exe', directCurlArgs(url, temp), (maxTime + 15) * 1000, proxyFreeEnv())
+    const bytes = statSize(temp)
+    if (r.code === 0 && bytes > 0) {
+      try { if (fs.existsSync(name)) fs.unlinkSync(name) } catch (e) {}
+      try {
+        fs.renameSync(temp, name)
+        const m = String(r.stdout || '').match(/^(\d+)\s+(\d+)\s+([\d.]+)/)
+        console.log('  官方地址直连成功  ' + name + '  ' + bytes + ' 字节  ' +
+          mbps(m ? Number(m[3]) : 0) + ' MB/s（未使用代理环境变量）')
+        return true
+      } catch (e) {
+        console.error('  直连文件提交失败：' + (e && e.message || e))
+        try { fs.unlinkSync(temp) } catch (x) {}
+        return false
+      }
+    }
+    console.warn('  官方直连失败：curl=' + r.code + ' bytes=' + bytes +
+      (r.stderr ? ' ' + String(r.stderr).slice(-180) : ''))
+    try { fs.unlinkSync(temp) } catch (e) {}
+    if (attempt < attempts) await sleep(1000)
+  }
+  return false
+}
+
+// Parse optional clone destination while skipping option values such as --depth 1.
+function cloneOutputDir(repo, rest) {
+  const valueOptions = new Set([
+    '-b', '--branch', '-o', '--origin', '-u', '--upload-pack', '--reference',
+    '--reference-if-able', '--separate-git-dir', '--depth', '--filter', '--jobs',
+    '-j', '--shallow-since', '--shallow-exclude', '--config', '-c',
+    '--server-option', '--template', '--bundle-uri', '--revision'
+  ])
+  const positionals = []
+  let afterEnd = false
+  for (let i = 0; i < rest.length; i++) {
+    const a = String(rest[i])
+    if (!afterEnd && a === '--') { afterEnd = true; continue }
+    if (!afterEnd && a.startsWith('-')) {
+      if (a.includes('=')) continue
+      if (valueOptions.has(a)) i++
+      continue
+    }
+    positionals.push(a)
+  }
+  if (positionals.length) return positionals[positionals.length - 1]
+  try {
+    return path.basename(new URL(repo).pathname.replace(/\/+$/, '')).replace(/\.git$/i, '')
+  } catch (e) {
+    return path.basename(String(repo).replace(/\.git$/i, ''))
+  }
+}
+function cleanupFailedClone(targetDir) {
+  // Called only after the caller verified the destination did not exist before this run.
+  try { if (fs.existsSync(targetDir)) fs.rmSync(targetDir, { recursive: true, force: true }) } catch (e) {}
+}
+function makeCloneArgs(rest, repo, prefix, direct) {
+  const C = CFG.clone || {}
+  const a = []
+  if (direct) {
+    // Explicitly clear general and URL-specific Git proxy config; environment vars are removed separately.
+    a.push('-c', 'http.proxy=', '-c', 'http.https://github.com/.proxy=')
+  }
+  a.push('-c', 'http.version=HTTP/1.1',
+    '-c', 'http.lowSpeedLimit=' + (C.low_speed_limit || 1024),
+    '-c', 'http.lowSpeedTime=' + (C.low_speed_time || 20))
+  if (prefix) a.push('-c', 'url.' + prefix + 'https://github.com/.insteadOf=https://github.com/')
+  return a.concat(['clone'], rest, [repo])
+}
+async function directCloneFallback(repo, rest, targetDir) {
+  const D = CFG.direct_fallback || {}
+  if (D.enabled === false) {
+    console.warn('  官方地址直连回退已禁用')
+    return false
+  }
+  const C = CFG.clone || {}
+  const attempts = Math.max(1, Math.min(3, Number(D.clone_retries || C.same_retry) || 2))
+  if (fs.existsSync(targetDir)) {
+    console.error('  目标目录已存在，拒绝删除或覆盖：' + targetDir)
+    return false
+  }
+  for (let attempt = 1; attempt <= attempts; attempt++) {
+    console.log('  所有镜像失败，尝试官方 GitHub 地址直连 ' + attempt + '/' + attempts + ' ...')
+    const r = await run('git.exe', makeCloneArgs(rest, repo, null, true), 1800000, proxyFreeEnv())
+    if (r.code === 0) {
+      console.log('  官方 GitHub 地址直连克隆成功')
+      return true
+    }
+    console.warn('  官方直连克隆失败：' + tail(r.stderr))
+    cleanupFailedClone(targetDir)
+    if (attempt < attempts) await sleep(1000)
+  }
+  return false
+}
 async function race(url, name) {
   const why = gate(url)
   if (why) { console.error('拒绝：' + why + '。只经反代取 GitHub 内容，且不携带凭据。'); process.exit(2) }
@@ -409,7 +532,11 @@ async function race(url, name) {
     cands = pickRacers(st, N, false)
     if (cands.length) console.warn('  没有入口过带宽门槛，退化为仅内容标记可用')
   }
-  if (!cands.length) { console.error('体检里没有可用入口，跑 node gh.mjs doctor --force'); process.exit(3) }
+  if (!cands.length) {
+    console.warn('  没有可用镜像入口，转官方地址直连')
+    if (!(await directDownloadFallback(url, name))) { console.error('镜像与官方直连均失败'); process.exitCode = 4 }
+    return
+  }
   const R = CFG.race
   const parts = cands.slice(0, Math.max(R.max, 2)).map(function (e, i) {
     return { entry: e, file: name + '.part' + i, proc: null, last: 0, stale: 0, tries: 0, firstSeen: 0 }
@@ -466,8 +593,11 @@ async function race(url, name) {
 
   if (!winner) {
     parts.forEach(function (p) { try { fs.unlinkSync(p.file) } catch (e) {} })
-    console.error('竞速失败：没有入口拿到完整文件')
-    process.exit(4)
+    if (!(await directDownloadFallback(url, name))) {
+      console.error('镜像与官方直连均失败；请检查 DNS、网络链路或稍后重试')
+      process.exitCode = 4
+    }
+    return
   }
   const m = String(report || '').match(/^(\d+)\s+(\d+)\s+([\d.]+)/)
   try { if (fs.existsSync(name)) fs.unlinkSync(name) } catch (e) {}
@@ -503,33 +633,40 @@ async function clone(args) {
   const why = gate(repo)
   if (why) { console.error('拒绝：' + why + '。只经反代克隆 GitHub 仓库，且不携带凭据。'); process.exit(2) }
   const rest = args.filter(function (a) { return a !== repo })
-  let candidates = await probeRefs(repo)
-  if (!candidates.length) {
-    const st = await checkAll(true)
-    candidates = pickRacers(st, Math.max(CFG.race.max || 3, 2), false)
-    console.log('  info/refs 探测没选出可用入口，退化为按体检评分顺序重试')
+  const targetDir = cloneOutputDir(repo, rest)
+  if (fs.existsSync(targetDir)) {
+    console.error('目标目录已存在，拒绝覆盖：' + targetDir + '。请指定一个不存在的新目录。')
+    process.exitCode = 2
+    return
   }
-  if (!candidates.length) { console.error('没有可用入口'); process.exit(3) }
+  let candidates = []
+  try { candidates = await probeRefs(repo) } catch (e) {
+    console.warn('镜像 info/refs 探测异常：' + String(e && e.message || e))
+  }
+  if (!candidates.length) {
+    try {
+      const st = await checkAll(true)
+      candidates = pickRacers(st, Math.max(CFG.race.max || 3, 2), false)
+    } catch (e) {
+      console.warn('镜像体检异常：' + String(e && e.message || e))
+    }
+    console.log('  info/refs 探测未找到可用入口，已尝试按体检评分回退')
+  }
   const C = CFG.clone || {}
   for (const e of candidates) {
     for (let attempt = 1; attempt <= (C.same_retry || 2); attempt++) {
       process.stdout.write('  经 ' + label(e.prefix) + ' 第' + attempt + ' 次 ... ')
-      const gitArgs = ['-c', 'http.version=HTTP/1.1',
-        '-c', 'http.lowSpeedLimit=' + (C.low_speed_limit || 1024),
-        '-c', 'http.lowSpeedTime=' + (C.low_speed_time || 20),
-        '-c', 'url.' + e.prefix + 'https://github.com/.insteadOf=https://github.com/']
-        .concat(['clone'], rest, [repo])
-      const r = await run('git.exe', gitArgs, 1800000)
+      const r = await run('git.exe', makeCloneArgs(rest, repo, e.prefix, false), 1800000)
       if (r.code === 0) { console.log('完成'); return }
       console.log('失败 ' + tail(r.stderr))
-      const dirs = rest.filter(function (x) { return x.charAt(0) !== '-' })
-      const dirname = dirs.length > 1 ? dirs[1] : repo.replace(/\.git$/, '').split('/').pop()
-      try { if (dirname && fs.existsSync(dirname)) fs.rmSync(dirname, { recursive: true, force: true }) } catch (x) {}
-      // schannel 随机握手失败（实测约 1/3 概率）值得原地重试一次
+      cleanupFailedClone(targetDir)
       if (!/handshake|RPC failed|empty reply|Failed to connect/i.test(r.stderr)) break
     }
   }
-  console.error('全部入口失败'); process.exit(4)
+  if (!(await directCloneFallback(repo, rest, targetDir))) {
+    console.error('镜像与官方直连均失败；未触碰运行前已存在的目标目录')
+    process.exitCode = 4
+  }
 }
 
 async function doctor(show, explore) {
@@ -593,6 +730,13 @@ if (SELFTEST) {
   T('没有尾巴时返回空', splitBody('just body'), { body: '', meta: '' })
   T('正文里出现同样标记时取最后一个', splitBody('a__GHW__b\n__GHW__404'), { body: 'a__GHW__b', meta: '404' })
   T('空输入不炸', splitBody(''), { body: '', meta: '' })
+  // Direct fallback invariants: bypass environment proxies and never install mirror rewrites.
+  const directArgs = directCurlArgs('https://github.com/example/repo/archive/refs/heads/main.zip', 'x.part-direct')
+  T('官方下载强制 --noproxy', directArgs.includes('--noproxy') && directArgs[directArgs.indexOf('--noproxy') + 1] === '*', true)
+  const directGitArgs = makeCloneArgs(['--depth', '1'], 'https://github.com/octocat/Hello-World.git', null, true)
+  T('官方克隆回退不含镜像重写', directGitArgs.some(function (x) { return String(x).indexOf('.insteadOf=') >= 0 }), false)
+  T('官方克隆回退显式清空代理', directGitArgs.includes('http.proxy=') && directGitArgs.includes('http.https://github.com/.proxy='), true)
+  T('克隆目录解析不会把 --depth 的值当目标', cloneOutputDir('https://github.com/octocat/Hello-World.git', ['--depth', '1']), 'Hello-World')
   // 冷却阶梯
   T('两次失败不冷却', cooldownFor(2, 1000), 0)
   T('三次失败进入 30 分钟冷却', cooldownFor(3, 1000) - 1000, 30 * 60e3)
