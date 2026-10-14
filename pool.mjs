@@ -110,6 +110,11 @@ export function pickProbes(entries, candList, n, rand, cfg) {
   const minSamples = P.min_samples || 2
   const ratio = P.explore_ratio === undefined ? 0.15 : P.explore_ratio
   const capPerPrefix = P.max_per_prefix || 2
+  // 2026-10-14 修（关键）：**先算评分**。此前这里直接读 e.score，但 pool-state.json 根本不存 score、
+  // 也没有别的调用点算过它 → `(b.score||0)-(a.score||0)` 恒为 0 → "按评分挑 exploit" 退化成
+  // 按池子键的插入顺序 → 实测后果：github.com 排名第 1 的 20.27.177.113（ok 52/76、469ms）
+  // 每次都被排在后面，而早已退网的 192.30.25x 反复被探 → 表现为"hosts 失效"。
+  scoreDomain(entries, now, cfg)
   const all = Object.keys(entries).map(function (k) { return Object.assign({ ip: entries[k].ip }, entries[k]) })
   const usable = all.filter(function (e) { return !inCooldown(e, now) })
   const known = usable.filter(function (e) { return (e.samples || 0) >= minSamples }).sort(function (a, b) { return (b.score || 0) - (a.score || 0) })
@@ -275,6 +280,12 @@ if (isMain) {
     const pruned = pruneState(st2, now, CFG)
     T('过期条目被裁剪', [pruned, !!st2.entries['a|1.1.1.1'], !!st2.entries['b|2.2.2.2']], [1, true, false])
     T('无时间戳条目算过期', pruneState({ entries: { 'c|3.3.3.3': { dom: 'c', ip: '3.3.3.3' } } }, now, CFG), 1)
+    // 2026-10-14 回归：pickProbes 必须自己算分再排序（此前 e.score 从不被算 → 排序空操作 → 好 IP 轮不到）
+    const hiE = { dom: 'd', ip: '1.1.1.1', samples: 10, ok_count: 9, fail_streak: 0, lats: [100, 100, 100], speeds: [1e6], last_ok: now }
+    const loE = { dom: 'd', ip: '2.2.2.2', samples: 10, ok_count: 1, fail_streak: 0, lats: [2000, 2000, 2000], speeds: [], last_ok: now - 86400e3 }
+    const both = { 'd|2.2.2.2': loE, 'd|1.1.1.1': hiE }   // 故意把低分的放在前面
+    const pick1 = pickProbes(both, [], 1, function () { return 0.5 }, CFG)
+    T('pickProbes 按评分选优', [pick1.length, pick1[0] && pick1[0].ip], [1, '1.1.1.1'])
     console.log(bad ? '  自测失败 ' + bad + ' 项' : '  自测全部通过')
     process.exit(bad ? 1 : 0)
   }

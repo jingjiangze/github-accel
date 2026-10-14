@@ -147,8 +147,21 @@ async function main() {
     domains[dom].push({ ip: ip, src: src, fam: fam(ip) })
   }
 
-  // 1) 多 DoH 合并（不信单一 DNS 视角）。放在最前面：它是"当前真实答案"，
-  //    而 meta/CF 只是官方网段里的抽样，配额不够时该先保 DoH。
+  // 0) 内置静态表（config.static_ips / static_ips6）——**排在最前**
+  //    2026-10-14 修：本仓 hosts 块注释一直写着候选来源含"内置"，但 discover 实际**从未**消费 static_ips。
+  //    实测后果：github.com 的 64 个候选全是 /meta 抽样出的老段（192.30.25x，早已退网）与页面段（185.199.x），
+  //    能钉的 20.27.177.113（与稳定的 api/codeload 同段）根本不在候选里。
+  //    排最前的另一个原因：池子每域每轮只留 ~1 个 explore 名额，且**按候选列表顺序取**——
+  //    排在后面就永远被 /meta 垃圾候选挡住，等于没加。
+  const totBefore = Object.keys(domains).reduce(function (s, d) { return s + domains[d].length }, 0)
+  for (const dom of Object.keys(CFG.domains || {})) {
+    for (const ip of ((CFG.static_ips || {})[dom] || [])) add(dom, ip, 'builtin')
+    for (const ip of ((CFG.static_ips6 || {})[dom] || [])) add(dom, ip, 'builtin6')
+  }
+  sources.builtin = Object.keys(domains).reduce(function (s, d) { return s + domains[d].length }, 0) - totBefore
+
+  // 1) 多 DoH 合并（不信单一 DNS 视角）。它是"当前真实答案"，但注意它通常与系统 DNS 基线同值
+  //    （基线每轮都会探），所以 explore 优先级让给 builtin 无损失。
   for (const dom of Object.keys(CFG.domains || {})) {
     for (const src of (D.doh || [])) {
       for (const type of ['A', 'AAAA']) {
