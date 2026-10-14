@@ -178,13 +178,12 @@ async function loadManifest(force) {
   if (!force && cache && cache.at && Date.now() - cache.at < ttl) {
     return { urls: manifestEntries(cache), at: cache.at, stale: false, source: sourceLabel(cache.sources), generated_at: cache.generated_at || '', sources: cache.sources || [] }
   }
-  const fetched = []
-  for (const url of manifestUrls()) {
+  const fetched = await Promise.all(manifestUrls().map(async function (url) {
     const r = await run('curl.exe', ['-sS', '-L', '--ssl-no-revoke', '--connect-timeout', '4', '--max-time', '12', url], 16000)
     let mf = null
     if (r.code === 0 && r.stdout) { try { mf = JSON.parse(r.stdout) } catch (e) { mf = null } }
-    fetched.push({ url: url, mf: mf })
-  }
+    return { url: url, mf: mf }
+  }))
   const merged = mergeManifests(fetched)
   if (merged.urls.length) {
     const rec = { at: Date.now(), generated_at: merged.sources.reduce(function (a, s) { return s.generated_at && s.generated_at > a ? s.generated_at : a }, ''), sources: merged.sources, entries: merged.urls.map(function (u) { return { url: u, ok: true } }) }
@@ -525,7 +524,17 @@ async function directCloneFallback(repo, rest, targetDir) {
 async function race(url, name) {
   const why = gate(url)
   if (why) { console.error('拒绝：' + why + '。只经反代取 GitHub 内容，且不携带凭据。'); process.exit(2) }
-  const st = await checkAll(false)
+  let st
+  try {
+    st = await checkAll(false)
+  } catch (e) {
+    console.warn('镜像体检失败，直接进入官方地址回退：' + String(e && e.message || e))
+    if (!(await directDownloadFallback(url, name))) {
+      console.error('镜像体检与官方直连均失败')
+      process.exitCode = 4
+    }
+    return
+  }
   const N = Math.max(CFG.race.max || 3, 2)
   let cands = pickRacers(st, N, true)
   if (!cands.length) {
@@ -539,7 +548,7 @@ async function race(url, name) {
   }
   const R = CFG.race
   const parts = cands.slice(0, Math.max(R.max, 2)).map(function (e, i) {
-    return { entry: e, file: name + '.part' + i, proc: null, last: 0, stale: 0, tries: 0, firstSeen: 0 }
+    return { entry: e, file: name + '.part' + i, proc: null, last: 0, stale: 0, tries: 0, firstSeen: 0, exhausted: false }
   })
   const launch = function (p, resume) {
     p.proc = startCurl(p.entry.prefix + url, p.file, !!resume)
@@ -555,19 +564,40 @@ async function race(url, name) {
     for (const p of parts) {
       const sz = statSize(p.file)
       if (p.proc && p.proc.done) {
-        const ok = p.proc.code === 0
+        const ok = p.proc.code === 0 && sz > 0
         if (ok) { winner = p; report = p.proc.out; break }
-        if (sz > 0 && p.tries < (R.retries_per_entry || 2)) { p.tries++; launch(p, true); continue }
+        if (p.tries < (R.retries_per_entry || 2)) {
+          p.tries++
+          launch(p, sz > 0)
+          continue
+        }
         p.proc = null
+        p.exhausted = true
         continue
       }
       if (!p.proc) continue
       // 从没拿到字节的入口早点踢掉
-      if (sz === 0 && Date.now() - p.firstSeen > R.first_byte_ms) { p.proc.child.kill(); p.proc = null; continue }
-      // 增速低于阈值的判停滞，换源续传
+      if (sz === 0 && Date.now() - p.firstSeen > R.first_byte_ms) {
+        p.proc.child.kill()
+        p.proc = null
+        if (p.tries < (R.retries_per_entry || 2)) {
+          p.tries++
+          launch(p, false)
+        } else {
+          p.exhausted = true
+        }
+        continue
+      }
+      // 增速低于阈值的判停滞，换源续传；到预算后将入口标记为耗尽。
       if (sz > 0 && sz - p.last < R.speed_limit_bps && Date.now() - p.stale > R.speed_time_ms) {
         p.proc.child.kill(); p.last = sz; p.stale = Date.now()
-        if (p.tries < (R.retries_per_entry || 2)) { p.tries++; launch(p, true) } else p.proc = null
+        if (p.tries < (R.retries_per_entry || 2)) {
+          p.tries++
+          launch(p, true)
+        } else {
+          p.proc = null
+          p.exhausted = true
+        }
         continue
       }
       if (sz > p.last) { p.last = sz; p.stale = Date.now() }
@@ -582,7 +612,7 @@ async function race(url, name) {
     }
     const alive = parts.filter(function (p) { return p.proc && !p.proc.done }).length
     if (alive === 0) {
-      const next = parts.filter(function (p) { return !p.proc })
+      const next = parts.filter(function (p) { return !p.proc && !p.exhausted })
       if (next.length) launch(next[0], statSize(next[0].file) > 0)
       else break
     }
