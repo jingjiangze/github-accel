@@ -1,0 +1,39 @@
+name: tests
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  node-selftests:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - name: Syntax checks
+        shell: pwsh
+        run: |
+          node --check accel.mjs
+          node --check gh.mjs
+          node --check clash.mjs
+          node --check discover.mjs
+          node --check hostsio.mjs
+          node --check ip.mjs
+          node --check manifest.mjs
+          node --check pool.mjs
+          node --check probe.mjs
+      - name: Offline self-tests
+        shell: pwsh
+        run: |
+          node probe.mjs --selftest
+          node ip.mjs --selftest
+          node hostsio.mjs --selftest
+          node accel.mjs --selftest
+          node gh.mjs --selftest
+          node relay/test/middleware.test.mjs
