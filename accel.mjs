@@ -643,7 +643,7 @@ if (SELFTEST) {
   const protectedOk = protectedDomains.every(function (d) { return NEVER_PIN_DOMAINS.has(d) })
   if (!protectedOk) bad++
   console.log('  ' + (protectedOk ? 'PASS' : 'FAIL') + '  GitHub 核心域禁止静态 hosts 固定' + (protectedOk ? '' : '（缺失保护域名）'))
-  const sampleBlock = [MARK_S, '# generated', '1.2.3.4  github.com  other.example', '2.2.2.2  raw.githubusercontent.com', '3.3.3.3  cdn.jsdelivr.net', MARK_E].join('\\r\\n')
+  const sampleBlock = [MARK_S, '# generated', '1.2.3.4  github.com  other.example', '2.2.2.2  raw.githubusercontent.com', '3.3.3.3  cdn.jsdelivr.net', MARK_E].join('\r\n')
   const cleanedBlock = stripProtectedPinsFromBlock(sampleBlock)
   const cleanupOk = cleanedBlock.changed && cleanedBlock.block.indexOf('github.com') < 0 &&
     cleanedBlock.block.indexOf('raw.githubusercontent.com') < 0 &&
